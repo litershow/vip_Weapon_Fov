@@ -25,6 +25,7 @@ IMenusApi* g_pMenus = nullptr;
 IUtilsApi* g_pUtils = nullptr;
 
 IVEngineServer2* engine = nullptr;
+static ISource2Server* g_pSource2Server = nullptr;
 static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
@@ -32,6 +33,8 @@ CEntitySystem* g_pEntitySystem = nullptr;
 std::vector<std::string> g_FOV[64];
 
 PLUGIN_EXPOSE(VIPFovWeapon, g_VIPFovWeapon);
+
+SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
 
 // -----------------------------------------------------------------------------
 // Runtime schema offsets. No build-specific field offsets are hard-coded.
@@ -63,9 +66,9 @@ static int g_NativeSetFOVMatches = 0;
 
 // Per-player target. 0 = no override / let the game use normal FOV.
 static std::array<int, 64> g_TargetFOV{};
-static std::array<uint32_t, 64> g_BurstGeneration{};
 static std::array<uint64_t, 64> g_AutoFixCount{};
-static CTimer* g_pWatchdogTimer = nullptr;
+static std::array<int, 64> g_ForceSyncFrames{};
+static std::array<int, 64> g_LastObservedFOV{};
 
 // -----------------------------------------------------------------------------
 // Schema helpers
@@ -438,11 +441,12 @@ static bool ResolveNativeSetFOV()
 // -----------------------------------------------------------------------------
 // FOV application
 // -----------------------------------------------------------------------------
-static bool ApplyRawCameraFOVFallback(int slot, int value)
+static bool ApplyRawCameraFOVFallback(int slot, int value, bool forceNetwork = true)
 {
-    // Fallback is intentionally the exact CameraServices-only mechanism from
-    // the diagnostic build that the user confirmed visually worked. It does
-    // NOT touch m_iDesiredFOV or any viewmodel field.
+    // This is the exact CameraServices mechanism that was visually confirmed
+    // to change both the world camera and the held weapon.  The important
+    // difference in this build is WHEN it is written: post-GameFrame, after
+    // weapon deploy/reset logic has run for the current server frame.
     CEntityInstance* pawn = GetPawn(slot);
     void* camera = GetCameraServices(slot);
 
@@ -458,7 +462,12 @@ static bool ApplyRawCameraFOVFallback(int slot, int value)
             reinterpret_cast<uintptr_t>(camera) + g_iCameraFOVRateOffset) = 0.0f;
     }
 
-    if (g_pUtils)
+    // Mark the parent networked camera-services field dirty. During the short
+    // force-sync window after a weapon switch we deliberately do this every
+    // frame, even if the server-side integer already equals the target.  This
+    // counters the client's/local deploy reset without waiting for a 50 ms
+    // watchdog tick.
+    if (forceNetwork && g_pUtils)
     {
         g_pUtils->SetStateChanged(
             reinterpret_cast<CBaseEntity*>(pawn),
@@ -470,37 +479,21 @@ static bool ApplyRawCameraFOVFallback(int slot, int value)
     return true;
 }
 
-static bool ApplyCameraFOVNow(int slot, int value)
+static bool ApplyCameraFOVNow(int slot, int value, bool forceNetwork = true)
 {
     if (slot < 0 || slot >= 64 || value <= 0)
         return false;
 
-    CEntityInstance* pawn = GetPawn(slot);
-    void* camera = GetCameraServices(slot);
-    if (!pawn || !camera)
-        return false;
-
-    if (g_pNativeSetFOV)
-    {
-        // startFOV=value deliberately reproduces the diagnostic camera=120/120
-        // state that was observed to pull back both camera and weapon.
-        return g_pNativeSetFOV(camera, pawn, value, value, 0.0f);
-    }
-
-    return ApplyRawCameraFOVFallback(slot, value);
+    // Runtime signature scanning did not match the user's actually loaded
+    // libserver build (matches=0), so the production path intentionally uses
+    // the already-proven CameraServices write instead of risking a call through
+    // a stale native signature.
+    return ApplyRawCameraFOVFallback(slot, value, forceNetwork);
 }
 
 static bool ResetCameraFOVNow(int slot)
 {
-    CEntityInstance* pawn = GetPawn(slot);
-    void* camera = GetCameraServices(slot);
-    if (!pawn || !camera)
-        return false;
-
-    if (g_pNativeSetFOV)
-        return g_pNativeSetFOV(camera, pawn, 0, 0, 0.0f);
-
-    return ApplyRawCameraFOVFallback(slot, 0);
+    return ApplyRawCameraFOVFallback(slot, 0, true);
 }
 
 static bool CameraNeedsRepair(int slot, int target)
@@ -511,7 +504,7 @@ static bool CameraNeedsRepair(int slot, int target)
     return ReadCameraFOV(slot) != target || ReadCameraFOVStart(slot) != target;
 }
 
-static bool EnsureTargetFOV(int slot, bool countRepair)
+static bool EnsureTargetFOV(int slot, bool countRepair, bool forceNetwork = false)
 {
     if (slot < 0 || slot >= 64)
         return false;
@@ -520,85 +513,34 @@ static bool EnsureTargetFOV(int slot, bool countRepair)
     if (target <= 0)
         return false;
 
-    if (!CameraNeedsRepair(slot, target))
+    const bool mismatch = CameraNeedsRepair(slot, target);
+    if (!mismatch && !forceNetwork)
         return true;
 
-    const bool ok = ApplyCameraFOVNow(slot, target);
-    if (ok && countRepair)
+    const bool ok = ApplyCameraFOVNow(slot, target, true);
+    if (ok && mismatch && countRepair)
         ++g_AutoFixCount[slot];
     return ok;
 }
 
-static void BurstFrame(int slot, uint32_t generation, int framesLeft)
+static void ArmForceSync(int slot, int frames = 20)
 {
-    if (!g_pUtils || slot < 0 || slot >= 64 || framesLeft <= 0)
+    if (slot < 0 || slot >= 64)
         return;
-
-    if (generation != g_BurstGeneration[slot] || g_TargetFOV[slot] <= 0)
-        return;
-
-    EnsureTargetFOV(slot, true);
-
-    g_pUtils->NextFrame([slot, generation, framesLeft]()
-    {
-        BurstFrame(slot, generation, framesLeft - 1);
-    });
+    if (frames > g_ForceSyncFrames[slot])
+        g_ForceSyncFrames[slot] = frames;
 }
 
-static void StartRepairBurst(int slot, int frames = 32)
-{
-    if (!g_pUtils || slot < 0 || slot >= 64 || g_TargetFOV[slot] <= 0)
-        return;
-
-    const uint32_t generation = ++g_BurstGeneration[slot];
-    g_pUtils->NextFrame([slot, generation, frames]()
-    {
-        BurstFrame(slot, generation, frames);
-    });
-}
-
-static float WatchdogTick()
-{
-    for (int slot = 0; slot < 64; ++slot)
-    {
-        if (g_TargetFOV[slot] <= 0)
-            continue;
-
-        EnsureTargetFOV(slot, true);
-    }
-
-    // Pisex Utils timers use the returned positive value as the next interval.
-    return 0.05f;
-}
-
-static void StartWatchdog()
-{
-    if (!g_pUtils || g_pWatchdogTimer)
-        return;
-
-    g_pWatchdogTimer = g_pUtils->CreateTimer(0.05f, WatchdogTick);
-}
-
-static void StopWatchdog()
-{
-    if (!g_pUtils || !g_pWatchdogTimer)
-        return;
-
-    g_pUtils->RemoveTimer(g_pWatchdogTimer);
-    g_pWatchdogTimer = nullptr;
-}
-
-static bool SetTargetFOV(int slot, int value, bool burst = true)
+static bool SetTargetFOV(int slot, int value, bool forceSync = true)
 {
     if (slot < 0 || slot >= 64 || value <= 0)
         return false;
 
     g_TargetFOV[slot] = value;
+    if (forceSync)
+        ArmForceSync(slot, 24);
 
-    const bool ok = ApplyCameraFOVNow(slot, value);
-    if (burst)
-        StartRepairBurst(slot, 32);
-    return ok;
+    return ApplyCameraFOVNow(slot, value, true);
 }
 
 static void ClearTargetFOV(int slot, bool resetGameFOV)
@@ -607,7 +549,8 @@ static void ClearTargetFOV(int slot, bool resetGameFOV)
         return;
 
     g_TargetFOV[slot] = 0;
-    ++g_BurstGeneration[slot];
+    g_ForceSyncFrames[slot] = 0;
+    g_LastObservedFOV[slot] = 0;
 
     if (resetGameFOV)
         ResetCameraFOVNow(slot);
@@ -625,9 +568,21 @@ static void OnWeaponFOVResetEvent(const char*, IGameEvent* event, bool)
     if (slot < 0 || slot >= 64 || g_TargetFOV[slot] <= 0)
         return;
 
-    // Weapon deploy/reset can happen several frames after the event. The burst
-    // checks each frame but calls SetFOV only if CS2 actually changed the value.
-    StartRepairBurst(slot, 40);
+    // Repair immediately in case the reset happened before the event, then
+    // force several post-GameFrame network updates to cover the full deploy
+    // sequence. This avoids waiting until the following 50 ms timer tick.
+    EnsureTargetFOV(slot, true, true);
+    ArmForceSync(slot, 24);
+}
+
+static std::string CleanCommandToken(std::string token)
+{
+    while (!token.empty() && (token.front() == '"' || token.front() == '\''))
+        token.erase(token.begin());
+    while (!token.empty() && (token.back() == '"' || token.back() == '\'' ||
+                              token.back() == '\r' || token.back() == '\n'))
+        token.pop_back();
+    return token;
 }
 
 static std::string LastToken(const char* text)
@@ -640,7 +595,7 @@ static std::string LastToken(const char* text)
     std::string last;
     while (ss >> token)
         last = token;
-    return last;
+    return CleanCommandToken(last);
 }
 
 static void SplitList(const char* text, std::vector<std::string>& output)
@@ -669,30 +624,30 @@ static bool CommandFOVCam(int slot, const char* content)
     if (token == "off" || token == "0")
     {
         ClearTargetFOV(slot, true);
-        g_pUtils->PrintToChat(slot, "[FOV] override OFF; game FOV restored");
+        g_pUtils->PrintToChat(slot, "[FOV3] override OFF; game FOV restored");
         return true;
     }
 
     const int value = std::strtol(token.c_str(), nullptr, 10);
     if (value < 60 || value > 179)
     {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120 (60..179) or !fovcam off");
+        g_pUtils->PrintToChat(slot, "[FOV3] Usage: !fovfix 120 (60..179) or !fovfix off");
         return true;
     }
 
     if (!SetTargetFOV(slot, value, true))
     {
-        g_pUtils->PrintToChat(slot, "[FOV] SetFOV failed. Check server console / !fovdiag");
+        g_pUtils->PrintToChat(slot, "[FOV3] CameraServices write failed. Check !fovdiag3");
         return true;
     }
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] target=%d camera=%d/%d native=%s",
+        "[FOV3] requested=%d target=%d camera=%d/%d mode=post-frame",
         value,
+        g_TargetFOV[slot],
         ReadCameraFOV(slot),
-        ReadCameraFOVStart(slot),
-        g_pNativeSetFOV ? "yes" : "fallback"
+        ReadCameraFOVStart(slot)
     );
     return true;
 }
@@ -706,27 +661,26 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] target=%d cam=%d/%d rate=%.3f time=%.3f fixes=%llu",
+        "[FOV3] target=%d cam=%d/%d rate=%.3f time=%.3f fixes=%llu force=%d",
         g_TargetFOV[slot],
         ReadCameraFOV(slot),
         ReadCameraFOVStart(slot),
         ReadCameraFOVRate(slot),
         ReadCameraFOVTime(slot),
-        static_cast<unsigned long long>(g_AutoFixCount[slot])
+        static_cast<unsigned long long>(g_AutoFixCount[slot]),
+        g_ForceSyncFrames[slot]
     );
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] native=%s matches=%d rva=0x%lX desired(read-only)=%d",
-        g_pNativeSetFOV ? "YES" : "NO/fallback",
-        g_NativeSetFOVMatches,
-        static_cast<unsigned long>(g_NativeSetFOVRVA),
-        ReadDesiredFOV(slot)
+        "[FOV3] native-scan=disabled desired(read-only)=%d postGameFrame=%s",
+        ReadDesiredFOV(slot),
+        g_pSource2Server ? "YES" : "NO"
     );
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] cameraPtr=%s schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
+        "[FOV3] cameraPtr=%s schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
         camera ? "OK" : "NULL",
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
@@ -763,13 +717,40 @@ bool VIPFovWeapon::Load(
         SOURCE2ENGINETOSERVER_INTERFACE_VERSION
     );
 
+    GET_V_IFACE_CURRENT(
+        GetServerFactory,
+        g_pSource2Server,
+        ISource2Server,
+        SOURCE2SERVER_INTERFACE_VERSION
+    );
+
+    if (g_pSource2Server)
+    {
+        SH_ADD_HOOK(
+            IServerGameDLL,
+            GameFrame,
+            g_pSource2Server,
+            SH_MEMBER(this, &VIPFovWeapon::GameFrame),
+            true
+        );
+    }
+
     g_SMAPI->AddListener(this, this);
     return true;
 }
 
 bool VIPFovWeapon::Unload(char* error, size_t maxlen)
 {
-    StopWatchdog();
+    if (g_pSource2Server)
+    {
+        SH_REMOVE_HOOK(
+            IServerGameDLL,
+            GameFrame,
+            g_pSource2Server,
+            SH_MEMBER(this, &VIPFovWeapon::GameFrame),
+            true
+        );
+    }
 
     if (g_pUtils)
         g_pUtils->ClearAllHooks(g_PLID);
@@ -786,8 +767,12 @@ static void OnStartupServer()
     g_pEntitySystem = g_pUtils->GetCEntitySystem();
 
     ResolveOffsets();
-    ResolveNativeSetFOV();
-    StartWatchdog();
+    // Do not call the recovered native function in production. The user's
+    // actually loaded libserver returned a different runtime signature, so a
+    // guessed internal ABI is intentionally avoided.
+    g_pNativeSetFOV = nullptr;
+    g_NativeSetFOVMatches = 0;
+    g_NativeSetFOVRVA = 0;
 }
 
 static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
@@ -798,7 +783,8 @@ static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
     g_FOV[slot].clear();
     g_TargetFOV[slot] = 0;
     g_AutoFixCount[slot] = 0;
-    ++g_BurstGeneration[slot];
+    g_ForceSyncFrames[slot] = 0;
+    g_LastObservedFOV[slot] = 0;
 
     if (!isVIP || !g_pVIPCore)
         return;
@@ -814,7 +800,8 @@ static void VIP_OnClientDisconnect_FOVWeapon(int slot, bool)
     g_FOV[slot].clear();
     g_TargetFOV[slot] = 0;
     g_AutoFixCount[slot] = 0;
-    ++g_BurstGeneration[slot];
+    g_ForceSyncFrames[slot] = 0;
+    g_LastObservedFOV[slot] = 0;
 }
 
 static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int, bool isVIP)
@@ -832,10 +819,9 @@ static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int, bool isVIP)
         return;
 
     g_TargetFOV[slot] = selected;
-
-    // New pawn/services may not exist until the following frame. The burst is
-    // deliberately long enough to cover spawn + initial weapon deploy resets.
-    StartRepairBurst(slot, 64);
+    // New pawn/services may not exist until the following frame; the post-frame
+    // hook keeps trying safely until CameraServices becomes available.
+    ArmForceSync(slot, 64);
 }
 
 static bool OpenFOVMenu(int slot, const char*)
@@ -916,8 +902,10 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     // Keep the one debug command the user already verified, but it now uses
     // the native SetFOV path and becomes persistent.
-    g_pUtils->RegCommand(g_PLID, {"mm_fovcam"}, {"!fovcam", "!realfov"}, CommandFOVCam);
-    g_pUtils->RegCommand(g_PLID, {"mm_fovdiag"}, {"!fovdiag", "!fovinfo"}, CommandFOVDiag);
+    // Unique v3 aliases are the recommended test commands: they cannot be
+    // intercepted by an older FOV module that still registered !fovcam.
+    g_pUtils->RegCommand(g_PLID, {"mm_fovfix", "mm_fovcam"}, {"!fovfix", "!fovcam", "!realfov"}, CommandFOVCam);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovdiag3", "mm_fovdiag"}, {"!fovdiag3", "!fovdiag", "!fovinfo"}, CommandFOVDiag);
 
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
     g_pUtils->HookEvent(g_PLID, "weapon_switch", OnWeaponFOVResetEvent);
@@ -931,15 +919,37 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVNative] loaded. CameraServices-only native FOV; no desiredFOV/viewmodel/client-command writes. Commands: !fovcam !fovdiag\n"
+        "[VIP-FOVFrameFix] loaded. CameraServices post-GameFrame enforcement. Test: !fovfix 120 / !fovdiag3\n"
     );
 }
 
+void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
+{
+    if (!simulating || !g_pUtils)
+        return;
+
+    for (int slot = 0; slot < 64; ++slot)
+    {
+        const int target = g_TargetFOV[slot];
+        if (target <= 0)
+            continue;
+
+        const int current = ReadCameraFOV(slot);
+        g_LastObservedFOV[slot] = current;
+
+        const bool force = g_ForceSyncFrames[slot] > 0;
+        EnsureTargetFOV(slot, true, force);
+
+        if (g_ForceSyncFrames[slot] > 0)
+            --g_ForceSyncFrames[slot];
+    }
+}
+
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "2.0-native"; }
+const char* VIPFovWeapon::GetVersion() { return "3.0-framefix"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
-const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVNative]"; }
-const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + native CameraServices SetFOV"; }
-const char* VIPFovWeapon::GetDescription() { return "Persistent VIP FOV through native libserver CameraServices SetFOV."; }
-const char* VIPFovWeapon::GetName() { return "[VIP] Native FOV + Weapon"; }
+const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVFrameFix]"; }
+const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + post-GameFrame CameraServices enforcement"; }
+const char* VIPFovWeapon::GetDescription() { return "Persistent VIP FOV with same-frame CameraServices repair on weapon switches."; }
+const char* VIPFovWeapon::GetName() { return "[VIP] FOV + Weapon FrameFix"; }
 const char* VIPFovWeapon::GetURL() { return "https://github.com/Pisex/cs2-vip-modules"; }
