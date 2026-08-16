@@ -15,7 +15,7 @@ IMenusApi* g_pMenus = nullptr;
 IUtilsApi* g_pUtils = nullptr;
 
 IVEngineServer2* engine = nullptr;
-ISchemaSystem* g_pSchemaSystem = nullptr;
+static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
 
@@ -39,11 +39,11 @@ static constexpr const char* kServerModule = "libserver.so";
 // longer drags in unrelated trace/damage/KeyValues3 code.
 static int FindServerOffset(const char* className, const char* fieldName)
 {
-    if (!g_pSchemaSystem || !className || !fieldName)
+    if (!s_pSchemaSystem || !className || !fieldName)
         return -1;
 
     CSchemaSystemTypeScope* scope =
-        g_pSchemaSystem->FindTypeScopeForModule(kServerModule);
+        s_pSchemaSystem->FindTypeScopeForModule(kServerModule);
 
     if (!scope)
         return -1;
@@ -340,7 +340,7 @@ bool VIPViewmodelFOV::Load(
 
     GET_V_IFACE_ANY(
         GetEngineFactory,
-        g_pSchemaSystem,
+        s_pSchemaSystem,
         ISchemaSystem,
         SCHEMASYSTEM_INTERFACE_VERSION
     );

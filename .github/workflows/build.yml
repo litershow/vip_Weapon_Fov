@@ -72,21 +72,23 @@ jobs:
           cd build
           ambuild -j 1
 
-      - name: Check undefined KeyValues3
+      - name: Verify linked plugin
         run: |
           SO="$(find build -type f -name 'vip_viewmodelfov.so' | head -1)"
           test -n "$SO"
 
           echo "Built: $SO"
-          echo "===== undefined KeyValues3 symbols ====="
 
+          echo "===== undefined KeyValues3 symbols ====="
           if nm -D -u "$SO" | grep -q 'KeyValues3'; then
             nm -D -u "$SO" | grep 'KeyValues3'
             echo "ERROR: plugin still has unresolved KeyValues3 symbols"
             exit 1
           fi
-
           echo "No unresolved KeyValues3 symbols."
+
+          echo "===== schema globals ====="
+          nm -D "$SO" | grep -E 'g_pSchemaSystem|s_pSchemaSystem' || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
