@@ -321,11 +321,10 @@ static std::string LastToken(const char* text)
 // Optional debug/test command: !fovweapon 110
 static bool CommandFOVWeapon(int slot, const char* content)
 {
-    if (!g_pVIPCore || !g_pVIPCore->VIP_IsClientVIP(slot))
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] VIP access required.");
+    // Debug command intentionally bypasses VIP access checks.
+    // The actual selectable VIP feature/menu remains VIP-only via VIP Core.
+    if (!g_pUtils)
         return true;
-    }
 
     const std::string token = LastToken(content);
 
@@ -589,7 +588,7 @@ void VIPFovWeapon::AllPluginsLoaded()
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "1.0"; }
+const char* VIPFovWeapon::GetVersion() { return "1.1"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
 const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVWeapon]"; }
 const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmodel adaptation"; }
