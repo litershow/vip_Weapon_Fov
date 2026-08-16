@@ -21,6 +21,10 @@ CEntitySystem* g_pEntitySystem = nullptr;
 
 std::vector<std::string> g_FOV[64];
 
+// Persistent target used by CameraServices. CS2 resets camera FOV when the
+// active weapon changes, so weapon events re-apply this value.
+static int g_TargetCameraFOV[64] = {};
+
 PLUGIN_EXPOSE(VIPFovWeapon, g_VIPFovWeapon);
 
 // Runtime schema offsets. Nothing here is hard-coded to a particular CS2 build.
@@ -416,29 +420,80 @@ static float ViewmodelFOVForWorldFOV(int worldFOV)
     return std::clamp(scaled, kMinViewmodelFOV, kMaxViewmodelFOV);
 }
 
-// Apply both fields together. This is the important difference from stock
-// VIP_FOV, which only changes CBasePlayerController::m_iDesiredFOV.
+// Final FOV path discovered by testing on the supplied Linux server build:
+// CameraServices affects both the world projection and the local weapon view.
+// m_iDesiredFOV is kept in sync as well, but m_flViewmodelFOV is NOT used for
+// the final effect because the CS2 client accepted the network value while
+// visually ignoring it.
 static bool ApplyCombinedFOV(int slot, int worldFOV)
 {
-    const float viewmodelFOV = ViewmodelFOVForWorldFOV(worldFOV);
+    if (slot < 0 || slot >= 64 || worldFOV <= 0)
+        return false;
 
-    const bool worldOk = SetWorldFOV(slot, worldFOV);
-    const bool weaponOk = SetViewmodelFOV(slot, viewmodelFOV);
+    g_TargetCameraFOV[slot] = worldFOV;
 
-    if (!worldOk || !weaponOk)
+    const bool desiredOk = SetWorldFOV(slot, worldFOV);
+    const bool cameraOk = SetCameraFOV(slot, worldFOV);
+
+    if (!desiredOk || !cameraOk)
     {
         ConColorMsg(
             Color(255, 180, 50, 255),
-            "[VIP-FOVWeapon] apply failed for slot %d: world=%d weapon=%d (FOV=%d VM=%.2f)\n",
+            "[VIP-FOVWeapon] apply failed for slot %d: desired=%d camera=%d (FOV=%d)\n",
             slot,
-            worldOk ? 1 : 0,
-            weaponOk ? 1 : 0,
-            worldFOV,
-            viewmodelFOV
+            desiredOk ? 1 : 0,
+            cameraOk ? 1 : 0,
+            worldFOV
         );
     }
 
-    return worldOk && weaponOk;
+    return desiredOk && cameraOk;
+}
+
+static void ReapplyCameraFOV(int slot)
+{
+    if (!g_pUtils || slot < 0 || slot >= 64)
+        return;
+
+    const int target = g_TargetCameraFOV[slot];
+    if (target <= 0)
+        return;
+
+    // Weapon switching can reset CameraServices during/after the event.
+    // Re-apply on the next frame and once more on the following frame so the
+    // engine's weapon-change write cannot win the race.
+    g_pUtils->NextFrame([slot]()
+    {
+        if (slot < 0 || slot >= 64 || g_TargetCameraFOV[slot] <= 0)
+            return;
+
+        SetCameraFOV(slot, g_TargetCameraFOV[slot]);
+        SetWorldFOV(slot, g_TargetCameraFOV[slot]);
+
+        if (!g_pUtils)
+            return;
+
+        g_pUtils->NextFrame([slot]()
+        {
+            if (slot < 0 || slot >= 64 || g_TargetCameraFOV[slot] <= 0)
+                return;
+
+            SetCameraFOV(slot, g_TargetCameraFOV[slot]);
+            SetWorldFOV(slot, g_TargetCameraFOV[slot]);
+        });
+    });
+}
+
+static void OnWeaponFOVResetEvent(const char*, IGameEvent* event, bool)
+{
+    if (!event)
+        return;
+
+    const int slot = event->GetPlayerSlot("userid").Get();
+    if (slot < 0 || slot >= 64 || g_TargetCameraFOV[slot] <= 0)
+        return;
+
+    ReapplyCameraFOV(slot);
 }
 
 static void SplitList(const char* text, std::vector<std::string>& output)
@@ -513,15 +568,19 @@ static bool CommandFOVWeapon(int slot, const char* content)
         return true;
     }
 
-    const float vm = ViewmodelFOVForWorldFOV(value);
-
     if (!ApplyCombinedFOV(slot, value))
     {
         g_pUtils->PrintToChat(slot, "[FOV] Failed. Check server console offsets.");
         return true;
     }
 
-    g_pUtils->PrintToChat(slot, "[FOV] world=%d viewmodel=%.2f", value, vm);
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] desired=%d camera=%d/%d (persistent)",
+        ReadWorldFOV(slot),
+        ReadCameraFOV(slot),
+        ReadCameraFOVStart(slot)
+    );
     return true;
 }
 
@@ -531,15 +590,24 @@ static bool CommandFOVCam(int slot, const char* content)
         return true;
 
     const std::string token = LastToken(content);
+
+    if (token == "off" || token == "0")
+    {
+        if (slot >= 0 && slot < 64)
+            g_TargetCameraFOV[slot] = 0;
+        g_pUtils->PrintToChat(slot, "[FOV] persistent camera reapply disabled");
+        return true;
+    }
+
     const int value = std::strtol(token.c_str(), nullptr, 10);
 
     if (value <= 0)
     {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120");
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120 (or !fovcam off)");
         return true;
     }
 
-    if (!SetCameraFOV(slot, value))
+    if (!ApplyCombinedFOV(slot, value))
     {
         g_pUtils->PrintToChat(slot, "[FOV] CameraServices write failed. See server console.");
         return true;
@@ -694,6 +762,7 @@ static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
         return;
 
     g_FOV[slot].clear();
+    g_TargetCameraFOV[slot] = 0;
 
     if (!isVIP || !g_pVIPCore)
         return;
@@ -719,9 +788,11 @@ static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int team, bool isVIP)
         (cookie && cookie[0]) ? std::strtol(cookie, nullptr, 10) : 90;
 
     // Re-apply one frame after spawn so the new pawn definitely exists.
+    g_TargetCameraFOV[slot] = worldFOV;
     g_pUtils->NextFrame([slot, worldFOV]()
     {
         ApplyCombinedFOV(slot, worldFOV);
+        ReapplyCameraFOV(slot);
     });
 }
 
@@ -861,6 +932,11 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
 
+    // Both event names are present in the supplied libserver.so. Different
+    // weapon transitions can use either path, so hook both.
+    g_pUtils->HookEvent(g_PLID, "weapon_switch", OnWeaponFOVResetEvent);
+    g_pUtils->HookEvent(g_PLID, "item_equip", OnWeaponFOVResetEvent);
+
     g_pVIPCore->VIP_OnClientLoaded(VIP_OnClientLoaded_FOVWeapon);
     g_pVIPCore->VIP_OnPlayerSpawn(VIP_OnPlayerSpawn_FOVWeapon);
 
@@ -875,19 +951,19 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] loaded. Diagnostic commands: !fovweapon !fovweaponinfo !fovcam !fovoffset !fovdiag\n"
+        "[VIP-FOVWeapon] loaded. Persistent CameraServices FOV enabled; weapon_switch/item_equip auto-reapply. Commands: !fovcam !fovdiag !fovoffset\n"
     );
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "1.2-diag"; }
+const char* VIPFovWeapon::GetVersion() { return "1.3-persistent"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
 const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVWeapon]"; }
 const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmodel adaptation"; }
 
 const char* VIPFovWeapon::GetDescription()
 {
-    return "VIP FOV that changes both camera/world FOV and weapon/viewmodel FOV.";
+    return "VIP FOV using CameraServices, automatically restored after weapon switches.";
 }
 
 const char* VIPFovWeapon::GetName()
