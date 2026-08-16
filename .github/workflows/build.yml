@@ -65,7 +65,9 @@ jobs:
             --enable-optimize \
             --hl2sdk-manifests="$MMS_PATH/hl2sdk-manifests" \
             --mms_path="$MMS_PATH" \
-            --hl2sdk-root="$HL2SDK_ROOT"
+            --hl2sdk-root="$HL2SDK_ROOT" \
+            --plugin-name vip_viewmodelfov \
+            --plugin-alias vip_viewmodelfov
 
       - name: Build
         run: |
