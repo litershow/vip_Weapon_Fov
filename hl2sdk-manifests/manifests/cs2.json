@@ -18,7 +18,6 @@
         "public",
         "public/engine",
         "public/mathlib",
-        "public/vstdlib",
         "public/tier0",
         "public/tier1",
         "public/entity2",
@@ -31,7 +30,6 @@
         "x86_64": {
             "postlink_libs": [
                 "lib/linux64/mathlib.a",
-                "lib/linux64/tier1.a",
                 "lib/linux64/interfaces.a",
                 "lib/linux64/release/libprotobuf.a"
             ],
@@ -51,7 +49,6 @@
                 "lib/public/win64/2015/libprotobuf.lib",
                 "lib/public/win64/mathlib.lib",
                 "lib/public/win64/tier0.lib",
-                "lib/public/win64/tier1.lib",
                 "lib/public/win64/interfaces.lib"
             ]
         },

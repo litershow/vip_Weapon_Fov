@@ -88,6 +88,21 @@ jobs:
           test -f "$SCHEMA_DIR/module.cpp"
           test -f "$SCHEMA_DIR/ctimer.cpp"
 
+      - name: Verify current CS2 manifest
+        run: |
+          echo "===== Metamod CS2 manifest ====="
+          cat "$MMS_PATH/hl2sdk-manifests/manifests/cs2.json"
+
+          if grep -q '"lib/linux64/tier1.a"'             "$MMS_PATH/hl2sdk-manifests/manifests/cs2.json"; then
+            echo "ERROR: Metamod manifest still references removed tier1.a"
+            exit 1
+          fi
+
+          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/mathlib.a"
+          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/interfaces.a"
+          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/release/libprotobuf.a"
+          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/libtier0.so"
+
       - name: Configure
         run: |
           rm -rf "$GITHUB_WORKSPACE/build"
@@ -98,7 +113,7 @@ jobs:
             -s cs2 \
             --targets x86_64 \
             --enable-optimize \
-            --hl2sdk-manifests="$GITHUB_WORKSPACE/hl2sdk-manifests" \
+            --hl2sdk-manifests="$MMS_PATH/hl2sdk-manifests" \
             --mms_path="$MMS_PATH" \
             --hl2sdk-root="$HL2SDK_ROOT"
 
