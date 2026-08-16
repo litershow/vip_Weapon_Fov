@@ -73,6 +73,13 @@ static int g_NativeSetFOVMatches = 0;
 static bool g_DetourInstalled = false;
 static bool g_EntryWasPreHooked = false;
 static const char* g_EntryState = "unresolved";
+static const char* g_ResolverMethod = "none";
+static int g_ServerModuleCandidates = 0;
+static int g_BodyAnchorMatches = 0;
+static int g_ResetCallSites = 0;
+static int g_ResetUniqueTargets = 0;
+static std::string g_SelectedModulePath;
+static std::string g_EntryBytesHex;
 
 #ifndef _WIN32
 static constexpr size_t kDetourPatchSize = 17; // whole prologue instructions
@@ -118,7 +125,7 @@ static void ResolveOffsets()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVChain] schema: Pawn=0x%X CameraPtr=0x%X FOV=0x%X Start=0x%X Rate=0x%X Owner=0x%X\n",
+        "[VIP-FOVResolver6] schema: Pawn=0x%X CameraPtr=0x%X FOV=0x%X Start=0x%X Rate=0x%X Owner=0x%X\n",
         g_iPlayerPawnHandleOffset,
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
@@ -258,6 +265,11 @@ struct ServerModuleScanInfo
     std::string path;
 };
 
+struct ServerModuleCollection
+{
+    std::vector<ServerModuleScanInfo> modules;
+};
+
 static bool IsServerModulePath(const char* path)
 {
     if (!path || !path[0])
@@ -274,9 +286,9 @@ static int FindServerModuleCallback(struct dl_phdr_info* info, size_t, void* opa
     if (!info || !opaque || !IsServerModulePath(info->dlpi_name))
         return 0;
 
-    auto* out = reinterpret_cast<ServerModuleScanInfo*>(opaque);
-    out->base = static_cast<uintptr_t>(info->dlpi_addr);
-    out->path = info->dlpi_name ? info->dlpi_name : "";
+    ServerModuleScanInfo module;
+    module.base = static_cast<uintptr_t>(info->dlpi_addr);
+    module.path = info->dlpi_name ? info->dlpi_name : "";
 
     for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i)
     {
@@ -284,11 +296,16 @@ static int FindServerModuleCallback(struct dl_phdr_info* info, size_t, void* opa
         if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_X) == 0 || phdr.p_memsz == 0)
             continue;
 
-        const uintptr_t begin = out->base + static_cast<uintptr_t>(phdr.p_vaddr);
-        out->executable.push_back({begin, begin + static_cast<uintptr_t>(phdr.p_memsz)});
+        const uintptr_t begin = module.base + static_cast<uintptr_t>(phdr.p_vaddr);
+        module.executable.push_back({begin, begin + static_cast<uintptr_t>(phdr.p_memsz)});
     }
 
-    return 1;
+    if (!module.executable.empty())
+        reinterpret_cast<ServerModuleCollection*>(opaque)->modules.push_back(std::move(module));
+
+    // Do not stop at the first basename match. A dedicated server may have
+    // more than one module whose basename is server.so/libserver.so.
+    return 0;
 }
 
 static uint32_t ReadU32Unaligned(const uint8_t* p)
@@ -373,6 +390,115 @@ static bool DecodeExistingEntryJump(const uint8_t* entry, uintptr_t& destination
     return false;
 }
 
+static bool AddressInExecutableModule(const ServerModuleScanInfo& module, uintptr_t address)
+{
+    for (const ExecutableRange& range : module.executable)
+    {
+        if (address >= range.begin && address < range.end)
+            return true;
+    }
+    return false;
+}
+
+static bool WindowHasBytes(const uint8_t* begin, const uint8_t* end,
+                           const uint8_t* needle, size_t needleSize)
+{
+    if (!begin || !end || !needle || needleSize == 0 || begin >= end)
+        return false;
+
+    for (const uint8_t* p = begin; p + needleSize <= end; ++p)
+    {
+        if (std::memcmp(p, needle, needleSize) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void AddUniqueAddress(std::vector<uintptr_t>& values, uintptr_t value)
+{
+    if (value != 0 && std::find(values.begin(), values.end(), value) == values.end())
+        values.push_back(value);
+}
+
+static void ScanResetCallTargets(const ServerModuleScanInfo& module,
+                                 std::vector<uintptr_t>& uniqueTargets,
+                                 int& callSiteCount)
+{
+    if (g_iCameraServicesOffset < 0)
+        return;
+
+    static constexpr uint8_t kZeroEDX[] = {0x31, 0xD2};
+    static constexpr uint8_t kZeroECX[] = {0x31, 0xC9};
+    static constexpr uint8_t kZeroXMM0A[] = {0x66, 0x0F, 0xEF, 0xC0}; // pxor xmm0,xmm0
+    static constexpr uint8_t kZeroXMM0B[] = {0x0F, 0x57, 0xC0};       // xorps xmm0,xmm0
+
+    for (const ExecutableRange& range : module.executable)
+    {
+        const auto* begin = reinterpret_cast<const uint8_t*>(range.begin);
+        const auto* end = reinterpret_cast<const uint8_t*>(range.end);
+        if (end <= begin + 96)
+            continue;
+
+        for (const uint8_t* p = begin + 64; p + 16 <= end; ++p)
+        {
+            // mov rdi, [<pawn-register> + m_pCameraServices]
+            // 48/49 8B /r with mod=disp32 and destination register RDI.
+            const uint8_t rex = p[0];
+            if ((rex != 0x48 && rex != 0x49) || p[1] != 0x8B)
+                continue;
+
+            const uint8_t modrm = p[2];
+            if ((modrm & 0xF8) != 0xB8 || (modrm & 0x07) == 0x04)
+                continue; // destination != rdi, or SIB form we intentionally skip
+
+            if (ReadU32Unaligned(p + 3) != static_cast<uint32_t>(g_iCameraServicesOffset))
+                continue;
+
+            // Immediately after the camera load the supplied build moves the
+            // pawn into RSI (second SetFOV argument), then performs call rel32.
+            const uint8_t* q = p + 7;
+            if ((q[0] != 0x48 && q[0] != 0x4C) || q[1] != 0x89 ||
+                (q[2] & 0xC7) != 0xC6 || q[3] != 0xE8)
+                continue;
+
+            const uint8_t* windowBegin = p - 64;
+            const bool zeroEDX = WindowHasBytes(windowBegin, p, kZeroEDX, sizeof(kZeroEDX));
+            const bool zeroECX = WindowHasBytes(windowBegin, p, kZeroECX, sizeof(kZeroECX));
+            const bool zeroXMM0 =
+                WindowHasBytes(windowBegin, p, kZeroXMM0A, sizeof(kZeroXMM0A)) ||
+                WindowHasBytes(windowBegin, p, kZeroXMM0B, sizeof(kZeroXMM0B));
+
+            if (!zeroEDX || !zeroECX || !zeroXMM0)
+                continue;
+
+            int32_t rel = 0;
+            std::memcpy(&rel, q + 4, sizeof(rel));
+            const uintptr_t callAddress = reinterpret_cast<uintptr_t>(q + 3);
+            const uintptr_t target = callAddress + 5 + static_cast<int64_t>(rel);
+            if (!AddressInExecutableModule(module, target))
+                continue;
+
+            ++callSiteCount;
+            AddUniqueAddress(uniqueTargets, target);
+        }
+    }
+}
+
+static std::string HexEntryBytes(const uint8_t* entry, size_t count)
+{
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    if (!entry || count == 0)
+        return out;
+    out.reserve(count * 2);
+    for (size_t i = 0; i < count; ++i)
+    {
+        out.push_back(kHex[(entry[i] >> 4) & 0xF]);
+        out.push_back(kHex[entry[i] & 0xF]);
+    }
+    return out;
+}
+
 static bool ResolveNativeSetFOV()
 {
     g_pNativeSetFOVEntry = nullptr;
@@ -381,65 +507,120 @@ static bool ResolveNativeSetFOV()
     g_NativeSetFOVMatches = 0;
     g_EntryWasPreHooked = false;
     g_EntryState = "unresolved";
+    g_ResolverMethod = "none";
+    g_ServerModuleCandidates = 0;
+    g_BodyAnchorMatches = 0;
+    g_ResetCallSites = 0;
+    g_ResetUniqueTargets = 0;
+    g_SelectedModulePath.clear();
+    g_EntryBytesHex.clear();
 
-    ServerModuleScanInfo module;
-    dl_iterate_phdr(FindServerModuleCallback, &module);
+    ServerModuleCollection collection;
+    dl_iterate_phdr(FindServerModuleCallback, &collection);
+    g_ServerModuleCandidates = static_cast<int>(collection.modules.size());
 
-    if (module.base == 0 || module.executable.empty())
+    if (collection.modules.empty())
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVChain] loaded server module/executable range not found.\n");
+            "[VIP-FOVResolver6] no loaded server.so/libserver.so executable module found.\n");
         return false;
     }
 
-    uintptr_t onlyEntry = 0;
-    for (const ExecutableRange& range : module.executable)
+    std::vector<uintptr_t> bodyEntries;
+    std::vector<uintptr_t> resetTargets;
+
+    for (const ServerModuleScanInfo& module : collection.modules)
     {
-        const auto* begin = reinterpret_cast<const uint8_t*>(range.begin);
-        const auto* end = reinterpret_cast<const uint8_t*>(range.end);
-
-        for (const uint8_t* p = begin; p + 19 <= end; ++p)
+        // Resolver A: old high-confidence body anchor. Useful when unchanged.
+        for (const ExecutableRange& range : module.executable)
         {
-            if (!MatchesNativeSetFOVBodyAnchor(p, end))
-                continue;
+            const auto* begin = reinterpret_cast<const uint8_t*>(range.begin);
+            const auto* end = reinterpret_cast<const uint8_t*>(range.end);
 
-            // In the supplied build the anchor starts at entry+0x2A. This part
-            // of the body remains intact under normal 5/12/14-byte detours.
-            constexpr ptrdiff_t kAnchorFromEntry = 0x2A;
-            if (p < begin + kAnchorFromEntry)
-                continue;
+            for (const uint8_t* p = begin; p + 19 <= end; ++p)
+            {
+                if (!MatchesNativeSetFOVBodyAnchor(p, end))
+                    continue;
 
-            const uint8_t* entry = p - kAnchorFromEntry;
-            const bool clean = LooksLikeCleanSetFOVEntry(entry);
-            uintptr_t chainedTarget = 0;
-            size_t chainedJumpSize = 0;
-            const bool preHooked = DecodeExistingEntryJump(entry, chainedTarget, chainedJumpSize);
+                ++g_BodyAnchorMatches;
+                constexpr ptrdiff_t kAnchorFromEntry = 0x2A;
+                if (p < begin + kAnchorFromEntry)
+                    continue;
 
-            // Refuse random false positives. Candidate must either have the
-            // expected original prologue or a detour form that we know how to chain.
-            if (!clean && !preHooked)
-                continue;
+                AddUniqueAddress(bodyEntries,
+                    reinterpret_cast<uintptr_t>(p - kAnchorFromEntry));
+            }
+        }
 
-            ++g_NativeSetFOVMatches;
-            onlyEntry = reinterpret_cast<uintptr_t>(entry);
+        // Resolver B: locate the game's own reset call SetFOV(camera,pawn,0,0,0)
+        // by m_pCameraServices schema displacement, then decode E8 rel32 target.
+        ScanResetCallTargets(module, resetTargets, g_ResetCallSites);
+    }
+
+    g_ResetUniqueTargets = static_cast<int>(resetTargets.size());
+
+    uintptr_t chosen = 0;
+    if (bodyEntries.size() == 1 && resetTargets.size() == 1)
+    {
+        if (bodyEntries[0] != resetTargets[0])
+        {
+            g_ResolverMethod = "conflict";
+            ConColorMsg(Color(255, 80, 80, 255),
+                "[VIP-FOVResolver6] resolver conflict: body=0x%lX resetTarget=0x%lX; hook disabled.\n",
+                static_cast<unsigned long>(bodyEntries[0]),
+                static_cast<unsigned long>(resetTargets[0]));
+            return false;
+        }
+        chosen = bodyEntries[0];
+        g_ResolverMethod = "body+reset-call";
+    }
+    else if (resetTargets.size() == 1)
+    {
+        chosen = resetTargets[0];
+        g_ResolverMethod = "reset-call";
+    }
+    else if (bodyEntries.size() == 1)
+    {
+        chosen = bodyEntries[0];
+        g_ResolverMethod = "body";
+    }
+    else
+    {
+        g_NativeSetFOVMatches = static_cast<int>(bodyEntries.size());
+        ConColorMsg(Color(255, 150, 50, 255),
+            "[VIP-FOVResolver6] unresolved: modules=%d body=%zu resetSites=%d resetTargets=%zu.\n",
+            g_ServerModuleCandidates,
+            bodyEntries.size(),
+            g_ResetCallSites,
+            resetTargets.size());
+        return false;
+    }
+
+    const ServerModuleScanInfo* selectedModule = nullptr;
+    for (const ServerModuleScanInfo& module : collection.modules)
+    {
+        if (AddressInExecutableModule(module, chosen))
+        {
+            selectedModule = &module;
+            break;
         }
     }
 
-    g_ServerBase = module.base;
-
-    if (g_NativeSetFOVMatches != 1 || onlyEntry == 0)
+    if (!selectedModule)
     {
-        ConColorMsg(Color(255, 150, 50, 255),
-            "[VIP-FOVChain] SetFOV body matches=%d in %s; detour DISABLED.\n",
-            g_NativeSetFOVMatches,
-            module.path.c_str());
+        g_ResolverMethod = "target-outside-module";
         return false;
     }
 
-    g_NativeSetFOVRVA = onlyEntry - module.base;
-    g_pNativeSetFOVEntry = reinterpret_cast<NativeSetFOVFn>(onlyEntry);
+    g_ServerBase = selectedModule->base;
+    g_SelectedModulePath = selectedModule->path;
+    g_NativeSetFOVRVA = chosen - selectedModule->base;
+    g_pNativeSetFOVEntry = reinterpret_cast<NativeSetFOVFn>(chosen);
+    g_NativeSetFOVMatches = 1;
 
-    const uint8_t* entry = reinterpret_cast<const uint8_t*>(onlyEntry);
+    const uint8_t* entry = reinterpret_cast<const uint8_t*>(chosen);
+    g_EntryBytesHex = HexEntryBytes(entry, 16);
+
     uintptr_t chainedTarget = 0;
     size_t chainedJumpSize = 0;
     if (LooksLikeCleanSetFOVEntry(entry))
@@ -454,16 +635,28 @@ static bool ResolveNativeSetFOV()
     }
     else
     {
+        // We found the native target, but do not overwrite an unknown prologue.
+        // !fovscan6 exposes the first 16 bytes so the resolver can be adapted
+        // without risking a server crash.
         g_EntryState = "unknown-entry";
+        ConColorMsg(Color(255, 150, 50, 255),
+            "[VIP-FOVResolver6] target found by %s at +0x%lX but entry is unknown (%s); hook disabled.\n",
+            g_ResolverMethod,
+            static_cast<unsigned long>(g_NativeSetFOVRVA),
+            g_EntryBytesHex.c_str());
         g_pNativeSetFOVEntry = nullptr;
         return false;
     }
 
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVChain] native SetFOV body found: %s + 0x%lX entry=%s.\n",
-        module.path.c_str(),
+        "[VIP-FOVResolver6] SetFOV resolved by %s: %s + 0x%lX entry=%s modules=%d body=%d resetSites=%d.\n",
+        g_ResolverMethod,
+        g_SelectedModulePath.c_str(),
         static_cast<unsigned long>(g_NativeSetFOVRVA),
-        g_EntryState);
+        g_EntryState,
+        g_ServerModuleCandidates,
+        g_BodyAnchorMatches,
+        g_ResetCallSites);
     return true;
 }
 
@@ -554,7 +747,7 @@ static bool InstallNativeSetFOVDetour()
         {
             g_TrampolineMemory = nullptr;
             ConColorMsg(Color(255, 80, 80, 255),
-                "[VIP-FOVChain] mmap trampoline failed; detour DISABLED.\n");
+                "[VIP-FOVResolver6] mmap trampoline failed; detour DISABLED.\n");
             return false;
         }
 
@@ -573,7 +766,7 @@ static bool InstallNativeSetFOVDetour()
     {
         g_EntryState = "unknown-entry";
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVChain] SetFOV entry has an unknown patch; refusing to overwrite it.\n");
+            "[VIP-FOVResolver6] SetFOV entry has an unknown patch; refusing to overwrite it.\n");
         return false;
     }
 
@@ -587,7 +780,7 @@ static bool InstallNativeSetFOVDetour()
         }
         g_pOriginalSetFOV = nullptr;
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVChain] mprotect libserver text failed; detour DISABLED.\n");
+            "[VIP-FOVResolver6] mprotect libserver text failed; detour DISABLED.\n");
         return false;
     }
 
@@ -602,7 +795,7 @@ static bool InstallNativeSetFOVDetour()
 
     g_DetourInstalled = true;
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVChain] SetFOV detour INSTALLED at libserver.so+0x%lX (%s).\n",
+        "[VIP-FOVResolver6] SetFOV detour INSTALLED at libserver.so+0x%lX (%s).\n",
         static_cast<unsigned long>(g_NativeSetFOVRVA),
         g_EntryState);
     return true;
@@ -634,13 +827,13 @@ static void RemoveNativeSetFOVDetour()
     }
 
     ConColorMsg(Color(220, 220, 80, 255),
-        "[VIP-FOVChain] SetFOV detour removed.\n");
+        "[VIP-FOVResolver6] SetFOV detour removed.\n");
 }
 #else
 static bool ResolveNativeSetFOV()
 {
     ConColorMsg(Color(255, 150, 50, 255),
-        "[VIP-FOVChain] native detour is Linux-only.\n");
+        "[VIP-FOVResolver6] native detour is Linux-only.\n");
     return false;
 }
 
@@ -751,14 +944,14 @@ static bool CommandFOVHook(int slot, const char* content)
     if (token == "off" || token == "0")
     {
         ClearTargetFOV(slot, true);
-        g_pUtils->PrintToChat(slot, "[FOV5] override OFF; native game FOV restored");
+        g_pUtils->PrintToChat(slot, "[FOV6] override OFF; native game FOV restored");
         return true;
     }
 
     const int value = std::strtol(token.c_str(), nullptr, 10);
     if (value < 60 || value > 179)
     {
-        g_pUtils->PrintToChat(slot, "[FOV5] Usage: !fovchain 120 (60..179) or !fovchain off");
+        g_pUtils->PrintToChat(slot, "[FOV6] Usage: !fovv6 120 (60..179) or !fovv6 off");
         return true;
     }
 
@@ -766,21 +959,23 @@ static bool CommandFOVHook(int slot, const char* content)
     {
         g_pUtils->PrintToChat(
             slot,
-            "[FOV5] detour unavailable: matches=%d rva=0x%lX. See server console",
-            g_NativeSetFOVMatches,
-            static_cast<unsigned long>(g_NativeSetFOVRVA));
+            "[FOV6] detour unavailable: resolver=%s body=%d resetSites=%d targets=%d; use !fovscan6",
+            g_ResolverMethod,
+            g_BodyAnchorMatches,
+            g_ResetCallSites,
+            g_ResetUniqueTargets);
         return true;
     }
 
     if (!SetTargetFOV(slot, value))
     {
-        g_pUtils->PrintToChat(slot, "[FOV5] native SetFOV failed; check !fovchaininfo");
+        g_pUtils->PrintToChat(slot, "[FOV6] native SetFOV failed; check !fovscan6");
         return true;
     }
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV5] target=%d camera=%d/%d detour=ON (zero-reset blocked)",
+        "[FOV6] target=%d camera=%d/%d detour=ON (zero-reset blocked)",
         g_TargetFOV[slot],
         ReadCameraFOV(slot),
         ReadCameraFOVStart(slot));
@@ -796,7 +991,7 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV5] target=%d cam=%d/%d detour=%s resetsBlocked=%llu emergency=%llu",
+        "[FOV6] target=%d cam=%d/%d detour=%s resetsBlocked=%llu emergency=%llu",
         g_TargetFOV[slot],
         ReadCameraFOV(slot),
         ReadCameraFOVStart(slot),
@@ -806,15 +1001,24 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV5] native matches=%d rva=0x%lX entry=%s pawn=%s",
-        g_NativeSetFOVMatches,
-        static_cast<unsigned long>(g_NativeSetFOVRVA),
-        g_EntryState,
-        g_CachedPawn[slot] ? "OK" : "NULL");
+        "[FOV6] resolver=%s modules=%d body=%d resetSites=%d targets=%d",
+        g_ResolverMethod,
+        g_ServerModuleCandidates,
+        g_BodyAnchorMatches,
+        g_ResetCallSites,
+        g_ResetUniqueTargets);
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV5] schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
+        "[FOV6] native rva=0x%lX entry=%s pawn=%s bytes=%s",
+        static_cast<unsigned long>(g_NativeSetFOVRVA),
+        g_EntryState,
+        g_CachedPawn[slot] ? "OK" : "NULL",
+        g_EntryBytesHex.empty() ? "-" : g_EntryBytesHex.c_str());
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV6] schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
         g_iCameraFOVStartOffset,
@@ -978,14 +1182,14 @@ static void OnStartupServer()
     if (!schemaOK)
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVChain] required schema fields missing; detour DISABLED.\n");
+            "[VIP-FOVResolver6] required schema fields missing; detour DISABLED.\n");
         return;
     }
 
     if (!InstallNativeSetFOVDetour())
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVChain] hook was NOT installed. !fovchain will refuse to enable.\n");
+            "[VIP-FOVResolver6] hook was NOT installed. !fovv6 will refuse to enable.\n");
     }
 }
 
@@ -996,27 +1200,27 @@ void VIPFovWeapon::AllPluginsLoaded()
     g_pUtils = reinterpret_cast<IUtilsApi*>(g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pUtils)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVChain] Utils API not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] Utils API not found.\n");
         return;
     }
 
     g_pMenus = reinterpret_cast<IMenusApi*>(g_SMAPI->MetaFactory(Menus_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pMenus)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVChain] Menus API not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] Menus API not found.\n");
         return;
     }
 
     g_pVIPCore = reinterpret_cast<IVIPApi*>(g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pVIPCore)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVChain] VIP Core not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] VIP Core not found.\n");
         return;
     }
 
     // Unique names: do not collide with any of the old experimental builds.
-    g_pUtils->RegCommand(g_PLID, {"mm_fovchain"}, {"!fovchain"}, CommandFOVHook);
-    g_pUtils->RegCommand(g_PLID, {"mm_fovchaininfo"}, {"!fovchaininfo"}, CommandFOVDiag);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovv6"}, {"!fovv6"}, CommandFOVHook);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovscan6"}, {"!fovscan6"}, CommandFOVDiag);
 
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
 
@@ -1026,7 +1230,7 @@ void VIPFovWeapon::AllPluginsLoaded()
     g_pVIPCore->VIP_RegisterFeature("FOV", VIP_STRING, SELECTABLE, OpenFOVMenu);
 
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVChain] loaded. Test only: !fovchain 120 / !fovchaininfo / !fovchain off\n");
+        "[VIP-FOVResolver6] loaded. Test only: !fovv6 120 / !fovscan6 / !fovv6 off\n");
 }
 
 void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
@@ -1069,10 +1273,10 @@ void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "5.0-chain-detour"; }
+const char* VIPFovWeapon::GetVersion() { return "6.0-reset-call-resolver"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
-const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVChain]"; }
-const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + chainable native CameraServices SetFOV detour"; }
-const char* VIPFovWeapon::GetDescription() { return "VIP FOV that chains existing SetFOV hooks and blocks zero-FOV resets before they reach the client."; }
-const char* VIPFovWeapon::GetName() { return "[VIP] FOV + Weapon Chain Detour"; }
+const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVResolver6]"; }
+const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + native CameraServices SetFOV reset-call resolver"; }
+const char* VIPFovWeapon::GetDescription() { return "VIP FOV that resolves native SetFOV from the game reset call and blocks zero-FOV resets before they reach the client."; }
+const char* VIPFovWeapon::GetName() { return "[VIP] FOV + Weapon Resolver6"; }
 const char* VIPFovWeapon::GetURL() { return "https://github.com/Pisex/cs2-vip-modules"; }
