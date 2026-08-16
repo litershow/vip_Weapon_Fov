@@ -1,0 +1,79 @@
+name: Build VIP_ViewmodelFOV
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git \
+            python3 \
+            python3-pip \
+            build-essential \
+            clang \
+            protobuf-compiler
+
+      - name: Install AMBuild
+        run: |
+          git clone https://github.com/alliedmodders/ambuild.git
+          cd ambuild
+          python3 -m pip install --user .
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Clone SchemaEntity
+        run: |
+          git clone https://github.com/Pisex/SchemaEntity.git SchemaEntity
+
+      - name: Clone Metamod Source
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/alliedmodders/metamod-source.git \
+            metamod-source
+
+      - name: Download CS2 SDK dependencies
+        run: |
+          cd metamod-source
+          ./support/checkout-deps.sh -s cs2
+
+      - name: Show directories
+        run: |
+          find . -maxdepth 3 -type d | sort | head -200
+
+      - name: Configure
+        working-directory: VIP_ViewmodelFOV/source
+        run: |
+          python3 configure.py \
+            --mms_path=$GITHUB_WORKSPACE/metamod-source \
+            --hl2sdk-root=$GITHUB_WORKSPACE \
+            --hl2sdk-manifests=$PWD/hl2sdk-manifests \
+            -s cs2 \
+            --targets=x86_64 \
+            --enable-optimize
+
+      - name: Build
+        working-directory: VIP_ViewmodelFOV/source
+        run: |
+          ambuild obj
+
+      - name: List output
+        run: |
+          find VIP_ViewmodelFOV/source/obj -type f -maxdepth 5 -print
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: VIP_ViewmodelFOV-linux
+          path: |
+            VIP_ViewmodelFOV/source/obj/**/*.so
+            VIP_ViewmodelFOV/source/obj/**/*.vdf
