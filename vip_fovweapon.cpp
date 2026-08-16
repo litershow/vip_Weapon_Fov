@@ -242,7 +242,8 @@ static bool EnsurePointClientCommand()
     }
 
     g_pUtils->DispatchSpawn(
-        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand)
+        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand),
+        nullptr
     );
 
     return true;

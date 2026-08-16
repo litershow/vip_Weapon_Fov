@@ -7,3 +7,7 @@
 - `!fovexact <value>` совмещает server world/camera FOV и клиентский `fov_cs_debug`.
 - Debug-команды больше не пишут `FOV_Value`, поэтому сохранённое VIP значение не должно перетирать тестовый FOV.
 - VIP-меню по-прежнему сохраняет cookie и применяет выбранное значение.
+
+## Build fix
+- Fixed Linux compile error in `EnsurePointClientCommand()`.
+- `IUtilsApi::DispatchSpawn` requires two arguments in this SDK, so the call now passes `nullptr` for `CEntityKeyValues*`.
