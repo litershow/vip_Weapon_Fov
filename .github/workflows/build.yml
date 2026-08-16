@@ -1,134 +1,142 @@
-name: Build VIP_ViewmodelFOV
+name: Build VIP Weapon Fov
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    permissions:
-      contents: write
-
     runs-on: ubuntu-latest
-
     container:
       image: ghcr.io/pisex/ubuntu20:latest
 
     env:
-      HL2SDK_ROOT: "${{ github.workspace }}/external"
-      MMS_PATH: "${{ github.workspace }}/external/metamod-source"
-      MANIFEST_PATH: "${{ github.workspace }}/VIP_ViewmodelFOV/source/hl2sdk-manifests"
+      HL2SDK_ROOT: ${{ github.workspace }}/external
+      MMS_PATH: ${{ github.workspace }}/external/metamod-source
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show repository structure
+      - name: Show repository layout
         run: |
+          echo "WORKSPACE=$GITHUB_WORKSPACE"
           pwd
-          find . -maxdepth 3 -type f | sort | head -200
+          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f | sort | head -200
 
-      - name: Set up dependencies
+      - name: Install build tools
         run: |
           export DEBIAN_FRONTEND=noninteractive
-
           apt-get update -qy
-
           apt-get install -y \
             git \
             binutils \
             python3 \
             python3-pip \
+            build-essential \
+            clang \
+            protobuf-compiler \
             zip
 
           python3 -m pip install --upgrade pip importlib-metadata
           python3 -m pip install setuptools==45.2.0
 
-          git clone https://github.com/alliedmodders/ambuild.git ambuild
-
-          cd ambuild
+          git clone https://github.com/alliedmodders/ambuild.git /tmp/ambuild
+          cd /tmp/ambuild
           pip3 install .
-          cd ..
 
-          mkdir -p external
-          cd external
+      - name: Clone Metamod and HL2SDK
+        run: |
+          mkdir -p "$HL2SDK_ROOT"
 
           git clone --recursive --branch master --single-branch \
-            https://github.com/alliedmodders/metamod-source.git
+            https://github.com/alliedmodders/metamod-source.git \
+            "$MMS_PATH"
 
           git clone --recursive --branch cs2 --single-branch \
-            https://github.com/alliedmodders/hl2sdk.git hl2sdk-cs2
+            https://github.com/alliedmodders/hl2sdk.git \
+            "$HL2SDK_ROOT/hl2sdk-cs2"
 
-          cd ..
+      - name: Clone SchemaEntity next to repository
+        run: |
+          # AMBuilder in this project uses:
+          #   ../SchemaEntity
+          # relative to the repository source root.
+          SCHEMA_DIR="$(dirname "$GITHUB_WORKSPACE")/SchemaEntity"
 
-          git clone https://github.com/Pisex/SchemaEntity.git SchemaEntity
+          rm -rf "$SCHEMA_DIR"
+          git clone https://github.com/Pisex/SchemaEntity.git "$SCHEMA_DIR"
 
+          # Compatibility fixes used by Pisex builds.
           sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' \
-            SchemaEntity/schemasystem.cpp
+            "$SCHEMA_DIR/schemasystem.cpp"
 
           sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' \
-            SchemaEntity/CCSPlayerPawn.h
+            "$SCHEMA_DIR/CCSPlayerPawn.h"
 
           sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
-            SchemaEntity/CCSPlayerController.h
+            "$SCHEMA_DIR/CCSPlayerController.h"
 
-      - name: Put SchemaEntity next to plugin
+          echo "SchemaEntity path: $SCHEMA_DIR"
+          ls -la "$SCHEMA_DIR" | head -50
+
+      - name: Verify source files
         run: |
-          rm -rf VIP_ViewmodelFOV/SchemaEntity
-          cp -r SchemaEntity VIP_ViewmodelFOV/SchemaEntity
+          test -f "$GITHUB_WORKSPACE/configure.py"
+          test -f "$GITHUB_WORKSPACE/AMBuildScript"
+          test -f "$GITHUB_WORKSPACE/AMBuilder"
+          test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.cpp"
+          test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.h"
+          test -f "$GITHUB_WORKSPACE/hl2sdk-manifests/SdkHelpers.ambuild"
 
-          echo "SchemaEntity:"
-          ls -la VIP_ViewmodelFOV/SchemaEntity | head -50
-
-      - name: Configure plugin
-        working-directory: VIP_ViewmodelFOV/source
+      - name: Configure
         run: |
-          mkdir -p build
-          cd build
+          rm -rf "$GITHUB_WORKSPACE/build"
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          cd "$GITHUB_WORKSPACE/build"
 
           python3 ../configure.py \
             -s cs2 \
             --targets x86_64 \
             --enable-optimize \
-            --hl2sdk-manifests=../hl2sdk-manifests \
-            --mms_path=$MMS_PATH \
-            --hl2sdk-root=$HL2SDK_ROOT
+            --hl2sdk-manifests="$GITHUB_WORKSPACE/hl2sdk-manifests" \
+            --mms_path="$MMS_PATH" \
+            --hl2sdk-root="$HL2SDK_ROOT"
 
-      - name: Build plugin
-        working-directory: VIP_ViewmodelFOV/source/build
+      - name: Build
         run: |
+          cd "$GITHUB_WORKSPACE/build"
           ambuild
 
-      - name: Show build output
+      - name: Show output
         if: always()
         run: |
-          echo "===== SO files ====="
-          find VIP_ViewmodelFOV -type f -name "*.so" -print || true
+          echo "=== shared libraries ==="
+          find "$GITHUB_WORKSPACE/build" -type f -name "*.so" -print || true
+          echo "=== package files ==="
+          find "$GITHUB_WORKSPACE/build/package" -type f -print 2>/dev/null || true
 
-          echo "===== package ====="
-          find VIP_ViewmodelFOV -path "*package*" -type f -print || true
-
-      - name: Collect artifact
+      - name: Package artifact
         run: |
-          mkdir -p artifact
+          cd "$GITHUB_WORKSPACE/build"
 
-          find VIP_ViewmodelFOV \
-            -type f \
-            \( -name "*.so" -o -name "*.vdf" \) \
-            -exec cp -v {} artifact/ \;
-
-          cp VIP_ViewmodelFOV/README_VIEWMODELFOV.md artifact/ || true
-
-          cd artifact
-          zip -r ../VIP_ViewmodelFOV-build.zip .
+          if [ -d package/addons ]; then
+            cd package
+            zip -r "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" addons
+          else
+            mkdir -p "$GITHUB_WORKSPACE/artifact"
+            find . -type f \( -name "*.so" -o -name "*.vdf" \) \
+              -exec cp -v {} "$GITHUB_WORKSPACE/artifact/" \;
+            cd "$GITHUB_WORKSPACE/artifact"
+            zip -r "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" .
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: VIP_ViewmodelFOV-linux
-          path: VIP_ViewmodelFOV-build.zip
+          path: VIP_ViewmodelFOV-linux.zip
+          if-no-files-found: error
