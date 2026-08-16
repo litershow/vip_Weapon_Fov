@@ -1,23 +1,12 @@
-# Changes
+# Changes — 1.4 final
 
-- Preserved VIP feature name `FOV` and cookie `FOV_Value`.
-- Added runtime SchemaSystem lookup for `CBasePlayerController::m_iDesiredFOV`.
-- Added runtime SchemaSystem lookup for `CCSPlayerPawn::m_flViewmodelFOV`.
-- Selecting/spawning now applies camera FOV and weapon/viewmodel FOV together.
-- Added proportional world->viewmodel FOV mapping.
-- Added `!fovweapon` and `!fovweaponinfo` test commands.
-- No hard-coded CS2 offsets are used.
-
-## 1.2-diag
-- Added runtime schema lookup for `CBasePlayerPawn::m_pCameraServices`.
-- Added `!fovcam <value>` to test `CCSPlayerBase_CameraServices::m_iFOV/m_iFOVStart`.
-- Added `!fovoffset <x> <y> <z>` to test server-networked viewmodel offsets.
-- Added `!fovdiag` / `!fovinfo` diagnostic output.
-
-
-## 1.3-persistent
-- Final VIP FOV path now uses `CCSPlayerBase_CameraServices::m_iFOV/m_iFOVStart`.
-- Stores target FOV per player.
-- Re-applies FOV after `weapon_switch` and `item_equip`, twice across next frames.
-- Keeps `m_iDesiredFOV` synchronized.
-- Leaves `m_flViewmodelFOV` as diagnostics only because client ignored it visually in testing.
+- one authoritative per-player FOV state;
+- debug commands and VIP menu no longer fight over different targets;
+- `!fovcam` updates the VIP `FOV_Value` cookie for VIP players;
+- automatic persistent viewmodel XYZ compensation for wide FOV;
+- manual `!fovoffset X Y Z` is persisted through weapon changes;
+- `!fovauto` restores automatic weapon-distance calculation;
+- six-frame event-driven reapply burst after `weapon_switch` / `item_equip`;
+- SchemaSystem offsets remain runtime-resolved (no hard-coded 0x1504 etc.);
+- output remains `vip_viewmodelfov.so`;
+- documented requirement to remove all older/original FOV modules to avoid multiple plugins overwriting each other.
