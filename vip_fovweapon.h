@@ -4,7 +4,6 @@
 #include <ISmmPlugin.h>
 #include <igameevents.h>
 #include <iserver.h>
-#include <eiface.h>
 #include <entity2/entitysystem.h>
 #include <entity2/entityinstance.h>
 #include <schemasystem/schemasystem.h>

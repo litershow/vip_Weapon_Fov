@@ -1,10 +1,20 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <link.h>
+#endif
 
 #include "vip_fovweapon.h"
 
@@ -19,50 +29,21 @@ static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
 
-// Client console commands are sent through IVEngineServer2::ClientCommand.
-// Do NOT create/DispatchSpawn point_clientcommand here: on current CS2 builds
-// the entity spawn path can crash when the underlying DispatchSpawn pointer/API is stale.
-
 std::vector<std::string> g_FOV[64];
-
-struct PlayerFOVState
-{
-    int worldFOV = 0;
-    float viewX = 2.50f;
-    float viewY = 2.00f;
-    float viewZ = -2.00f;
-    bool enabled = false;
-    bool customOffsets = false;
-};
-
-// One authoritative state per player. Both VIP menu changes and debug
-// commands update this same state, so an old VIP cookie cannot fight with a
-// newer !fovcam/!fovweapon value during weapon switches or respawns.
-static PlayerFOVState g_PlayerFOV[64];
 
 PLUGIN_EXPOSE(VIPFovWeapon, g_VIPFovWeapon);
 
-// Runtime schema offsets. Nothing here is hard-coded to a particular CS2 build.
-static int g_iDesiredFOVOffset = -1;
+// -----------------------------------------------------------------------------
+// Runtime schema offsets. No build-specific field offsets are hard-coded.
+// -----------------------------------------------------------------------------
+static int g_iDesiredFOVOffset = -1;          // diagnostics only; never written
 static int g_iPlayerPawnHandleOffset = -1;
-static int g_iViewmodelFOVOffset = -1;
-static int g_iViewmodelOffsetXOffset = -1;
-static int g_iViewmodelOffsetYOffset = -1;
-static int g_iViewmodelOffsetZOffset = -1;
 static int g_iCameraServicesOffset = -1;
 static int g_iCameraFOVOffset = -1;
 static int g_iCameraFOVStartOffset = -1;
+static int g_iCameraFOVTimeOffset = -1;
 static int g_iCameraFOVRateOffset = -1;
-
-// The client ignores the networked m_flViewmodelFOV for the local weapon on
-// current CS2 builds, but it DOES honor m_flViewmodelOffsetX/Y/Z. The default
-// CS2 "far" preset is 2.5 / 2.0 / -2.0. For FOV above 90 we push Y beyond the
-// normal client cvar clamp, which moves the viewmodel farther away and keeps
-// it visually proportional to the wider world FOV.
-static constexpr float kBaseWorldFOV = 90.0f;
-static constexpr float kBaseViewX = 2.50f;
-static constexpr float kBaseViewY = 2.00f;
-static constexpr float kBaseViewZ = -2.00f;
+static int g_iCameraZoomOwnerOffset = -1;
 
 #ifdef _WIN32
 static constexpr const char* kServerModule = "server.dll";
@@ -70,7 +51,25 @@ static constexpr const char* kServerModule = "server.dll";
 static constexpr const char* kServerModule = "libserver.so";
 #endif
 
-// Resolve a field directly from a declared server-side schema class.
+// The user-provided Linux libserver.so contains a native CameraServices SetFOV
+// routine. We locate it by code shape + runtime schema offsets, NOT by a fixed RVA.
+// Recovered SysV ABI for the supplied build:
+//   bool SetFOV(cameraServices, ownerPawn, targetFOV, startFOV, rate)
+using NativeSetFOVFn = bool (*)(void*, CEntityInstance*, int, int, float);
+static NativeSetFOVFn g_pNativeSetFOV = nullptr;
+static uintptr_t g_ServerBase = 0;
+static uintptr_t g_NativeSetFOVRVA = 0;
+static int g_NativeSetFOVMatches = 0;
+
+// Per-player target. 0 = no override / let the game use normal FOV.
+static std::array<int, 64> g_TargetFOV{};
+static std::array<uint32_t, 64> g_BurstGeneration{};
+static std::array<uint64_t, 64> g_AutoFixCount{};
+static CTimer* g_pWatchdogTimer = nullptr;
+
+// -----------------------------------------------------------------------------
+// Schema helpers
+// -----------------------------------------------------------------------------
 static int FindServerOffset(const char* className, const char* fieldName)
 {
     if (!s_pSchemaSystem || !className || !fieldName)
@@ -91,7 +90,6 @@ static int FindServerOffset(const char* className, const char* fieldName)
     for (int i = 0; i < classInfo->m_nFieldCount; ++i)
     {
         SchemaClassFieldData_t& field = classInfo->m_pFields[i];
-
         if (field.m_pszName && std::strcmp(field.m_pszName, fieldName) == 0)
             return field.m_nSingleInheritanceOffset;
     }
@@ -101,53 +99,43 @@ static int FindServerOffset(const char* className, const char* fieldName)
 
 static void ResolveOffsets()
 {
-    // This is the same field used by Pisex VIP_FOV.
     g_iDesiredFOVOffset =
         FindServerOffset("CBasePlayerController", "m_iDesiredFOV");
 
     g_iPlayerPawnHandleOffset =
         FindServerOffset("CCSPlayerController", "m_hPlayerPawn");
 
-    // This field was verified in the supplied Linux libserver.so and is a
-    // server-side networked field on CCSPlayerPawn.
-    g_iViewmodelFOVOffset =
-        FindServerOffset("CCSPlayerPawn", "m_flViewmodelFOV");
-    g_iViewmodelOffsetXOffset =
-        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetX");
-    g_iViewmodelOffsetYOffset =
-        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetY");
-    g_iViewmodelOffsetZOffset =
-        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetZ");
-
-    // Camera services live on the CBasePlayerPawn base class; the concrete
-    // Counter-Strike service object is CCSPlayerBase_CameraServices.
     g_iCameraServicesOffset =
         FindServerOffset("CBasePlayerPawn", "m_pCameraServices");
+
     g_iCameraFOVOffset =
         FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOV");
     g_iCameraFOVStartOffset =
         FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOVStart");
+    g_iCameraFOVTimeOffset =
+        FindServerOffset("CCSPlayerBase_CameraServices", "m_flFOVTime");
     g_iCameraFOVRateOffset =
         FindServerOffset("CCSPlayerBase_CameraServices", "m_flFOVRate");
+    g_iCameraZoomOwnerOffset =
+        FindServerOffset("CCSPlayerBase_CameraServices", "m_hZoomOwner");
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] offsets: Desired=0x%X Pawn=0x%X VMFOV=0x%X VMXYZ=[0x%X 0x%X 0x%X] CameraPtr=0x%X Camera=[FOV:0x%X Start:0x%X Rate:0x%X]\n",
-        g_iDesiredFOVOffset,
+        "[VIP-FOVNative] schema: Pawn=0x%X CameraPtr=0x%X Camera=[FOV:0x%X Start:0x%X Time:0x%X Rate:0x%X Owner:0x%X] Desired(read-only)=0x%X\n",
         g_iPlayerPawnHandleOffset,
-        g_iViewmodelFOVOffset,
-        g_iViewmodelOffsetXOffset,
-        g_iViewmodelOffsetYOffset,
-        g_iViewmodelOffsetZOffset,
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
         g_iCameraFOVStartOffset,
-        g_iCameraFOVRateOffset
+        g_iCameraFOVTimeOffset,
+        g_iCameraFOVRateOffset,
+        g_iCameraZoomOwnerOffset,
+        g_iDesiredFOVOffset
     );
 }
 
-// Avoid depending on generated CCSPlayerController/CCSPlayerPawn accessors.
-// The public entity list layout is enough for this module.
+// -----------------------------------------------------------------------------
+// Entity helpers
+// -----------------------------------------------------------------------------
 static CEntityInstance* EntityFromIndex(int index)
 {
     if (!g_pEntitySystem || index < 0 || index >= MAX_TOTAL_ENTITIES - 1)
@@ -155,13 +143,10 @@ static CEntityInstance* EntityFromIndex(int index)
 
     CEntityIdentity* chunk =
         g_pEntitySystem->m_EntityList.m_pIdentityChunks[index / MAX_ENTITIES_IN_LIST];
-
     if (!chunk)
         return nullptr;
 
-    CEntityIdentity* identity =
-        &chunk[index % MAX_ENTITIES_IN_LIST];
-
+    CEntityIdentity* identity = &chunk[index % MAX_ENTITIES_IN_LIST];
     if (identity->GetEntityIndex().Get() != index)
         return nullptr;
 
@@ -174,19 +159,15 @@ static CEntityInstance* EntityFromHandle(const CEntityHandle& handle)
         return nullptr;
 
     const int index = handle.GetEntryIndex();
-
     if (index < 0 || index >= MAX_TOTAL_ENTITIES - 1)
         return nullptr;
 
     CEntityIdentity* chunk =
         g_pEntitySystem->m_EntityList.m_pIdentityChunks[index / MAX_ENTITIES_IN_LIST];
-
     if (!chunk)
         return nullptr;
 
-    CEntityIdentity* identity =
-        &chunk[index % MAX_ENTITIES_IN_LIST];
-
+    CEntityIdentity* identity = &chunk[index % MAX_ENTITIES_IN_LIST];
     if (identity->GetRefEHandle() != handle)
         return nullptr;
 
@@ -195,7 +176,8 @@ static CEntityInstance* EntityFromHandle(const CEntityHandle& handle)
 
 static CEntityInstance* GetController(int slot)
 {
-    // Source 2 player controllers occupy entity indexes slot + 1.
+    if (slot < 0 || slot >= 64)
+        return nullptr;
     return EntityFromIndex(slot + 1);
 }
 
@@ -204,11 +186,8 @@ static CEntityInstance* GetPawn(int slot)
     if (g_iPlayerPawnHandleOffset < 0)
         ResolveOffsets();
 
-    if (g_iPlayerPawnHandleOffset < 0)
-        return nullptr;
-
     CEntityInstance* controller = GetController(slot);
-    if (!controller)
+    if (!controller || g_iPlayerPawnHandleOffset < 0)
         return nullptr;
 
     const CEntityHandle& pawnHandle =
@@ -218,43 +197,6 @@ static CEntityInstance* GetPawn(int slot)
         );
 
     return EntityFromHandle(pawnHandle);
-}
-
-static bool SendClientConsoleCommand(int slot, const std::string& command)
-{
-    if (!engine || slot < 0 || slot >= 64 || command.empty())
-        return false;
-
-    CPlayerSlot playerSlot(slot);
-    if (!playerSlot.IsValid())
-        return false;
-
-    // Native engine API. This mimics the client typing the command itself.
-    // The engine will only allow commands that are permitted for remote client
-    // execution (FCVAR_CLIENT_CAN_EXECUTE and other engine-side restrictions).
-    engine->ClientCommand(playerSlot, "%s", command.c_str());
-    return true;
-}
-
-static bool SendClientDebugFOV(int slot, int value)
-{
-    if (value <= 0)
-        return false;
-
-    return SendClientConsoleCommand(
-        slot,
-        std::string("fov_cs_debug ") + std::to_string(value)
-    );
-}
-
-static bool SendClientViewmodelFOV(int slot, float value)
-{
-    if (value <= 0.0f)
-        return false;
-
-    std::ostringstream cmd;
-    cmd << "viewmodel_fov " << value;
-    return SendClientConsoleCommand(slot, cmd.str());
 }
 
 static void* GetCameraServices(int slot)
@@ -272,40 +214,250 @@ static void* GetCameraServices(int slot)
     );
 }
 
-static bool SetCameraFOV(int slot, int value)
+static int ReadIntAt(void* object, int offset)
 {
-    if (value <= 0)
+    if (!object || offset < 0)
+        return 0;
+    return *reinterpret_cast<int*>(
+        reinterpret_cast<uintptr_t>(object) + static_cast<uintptr_t>(offset)
+    );
+}
+
+static float ReadFloatAt(void* object, int offset)
+{
+    if (!object || offset < 0)
+        return 0.0f;
+    return *reinterpret_cast<float*>(
+        reinterpret_cast<uintptr_t>(object) + static_cast<uintptr_t>(offset)
+    );
+}
+
+static int ReadCameraFOV(int slot)
+{
+    return ReadIntAt(GetCameraServices(slot), g_iCameraFOVOffset);
+}
+
+static int ReadCameraFOVStart(int slot)
+{
+    return ReadIntAt(GetCameraServices(slot), g_iCameraFOVStartOffset);
+}
+
+static float ReadCameraFOVRate(int slot)
+{
+    return ReadFloatAt(GetCameraServices(slot), g_iCameraFOVRateOffset);
+}
+
+static float ReadCameraFOVTime(int slot)
+{
+    return ReadFloatAt(GetCameraServices(slot), g_iCameraFOVTimeOffset);
+}
+
+static int ReadDesiredFOV(int slot)
+{
+    CEntityInstance* controller = GetController(slot);
+    if (!controller || g_iDesiredFOVOffset < 0)
+        return 0;
+    return ReadIntAt(controller, g_iDesiredFOVOffset);
+}
+
+// -----------------------------------------------------------------------------
+// Native libserver SetFOV resolver (Linux)
+// -----------------------------------------------------------------------------
+#ifndef _WIN32
+struct ExecutableRange
+{
+    uintptr_t begin = 0;
+    uintptr_t end = 0;
+};
+
+struct ServerModuleScanInfo
+{
+    uintptr_t base = 0;
+    std::vector<ExecutableRange> executable;
+};
+
+static bool EndsWithServerSo(const char* path)
+{
+    if (!path || !path[0])
+        return false;
+
+    const char* slash = std::strrchr(path, '/');
+    const char* name = slash ? slash + 1 : path;
+    return std::strcmp(name, "libserver.so") == 0;
+}
+
+static int FindServerModuleCallback(
+    struct dl_phdr_info* info,
+    size_t,
+    void* opaque)
+{
+    if (!info || !opaque || !EndsWithServerSo(info->dlpi_name))
+        return 0;
+
+    auto* out = reinterpret_cast<ServerModuleScanInfo*>(opaque);
+    out->base = static_cast<uintptr_t>(info->dlpi_addr);
+
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i)
+    {
+        const ElfW(Phdr)& phdr = info->dlpi_phdr[i];
+        if (phdr.p_type != PT_LOAD || (phdr.p_flags & PF_X) == 0 || phdr.p_memsz == 0)
+            continue;
+
+        const uintptr_t begin = out->base + static_cast<uintptr_t>(phdr.p_vaddr);
+        out->executable.push_back({begin, begin + static_cast<uintptr_t>(phdr.p_memsz)});
+    }
+
+    return 1; // libserver found; stop iteration
+}
+
+static uint32_t ReadU32Unaligned(const uint8_t* p)
+{
+    uint32_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static bool MatchesNativeSetFOVShape(const uint8_t* p, const uint8_t* end)
+{
+    if (!p || !end || p + 61 > end)
+        return false;
+
+    // Stable function prologue up through the first conditional branch.
+    static constexpr uint8_t prefix[] = {
+        0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56,
+        0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xEC,
+        0x58, 0xF3, 0x0F, 0x11, 0x45, 0x8C, 0x48, 0x85,
+        0xF6, 0x0F, 0x84
+    };
+
+    if (std::memcmp(p, prefix, sizeof(prefix)) != 0)
+        return false;
+
+    // Branch displacement p[27..30] is intentionally ignored.
+    static constexpr uint8_t middle[] = {
+        0x49, 0x89, 0xFF,       // mov r15,rdi
+        0x49, 0x89, 0xF6,       // mov r14,rsi
+        0x89, 0xD3,             // mov ebx,edx
+        0x41, 0x89, 0xCC,       // mov r12d,ecx
+        0x3B, 0x97              // cmp edx,[rdi+disp32]
+    };
+
+    if (std::memcmp(p + 31, middle, sizeof(middle)) != 0)
         return false;
 
     if (g_iCameraFOVOffset < 0 ||
-        g_iCameraFOVStartOffset < 0 ||
-        g_iCameraServicesOffset < 0)
+        ReadU32Unaligned(p + 44) != static_cast<uint32_t>(g_iCameraFOVOffset))
     {
-        ResolveOffsets();
+        return false;
     }
 
+    // Ignore second branch displacement, then validate zoom-owner access.
+    if (p[48] != 0x0F || p[49] != 0x84 ||
+        p[54] != 0x41 || p[55] != 0x8B || p[56] != 0x8F)
+    {
+        return false;
+    }
+
+    if (g_iCameraZoomOwnerOffset < 0 ||
+        ReadU32Unaligned(p + 57) != static_cast<uint32_t>(g_iCameraZoomOwnerOffset))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ResolveNativeSetFOV()
+{
+    g_pNativeSetFOV = nullptr;
+    g_ServerBase = 0;
+    g_NativeSetFOVRVA = 0;
+    g_NativeSetFOVMatches = 0;
+
+    if (g_iCameraFOVOffset < 0 || g_iCameraZoomOwnerOffset < 0)
+        ResolveOffsets();
+
+    if (g_iCameraFOVOffset < 0 || g_iCameraZoomOwnerOffset < 0)
+        return false;
+
+    ServerModuleScanInfo module;
+    dl_iterate_phdr(FindServerModuleCallback, &module);
+
+    if (module.base == 0 || module.executable.empty())
+    {
+        ConColorMsg(Color(255, 80, 80, 255),
+            "[VIP-FOVNative] could not locate loaded libserver.so executable segment.\n");
+        return false;
+    }
+
+    uintptr_t onlyMatch = 0;
+
+    for (const ExecutableRange& range : module.executable)
+    {
+        const auto* begin = reinterpret_cast<const uint8_t*>(range.begin);
+        const auto* end = reinterpret_cast<const uint8_t*>(range.end);
+
+        for (const uint8_t* p = begin; p + 61 <= end; ++p)
+        {
+            if (!MatchesNativeSetFOVShape(p, end))
+                continue;
+
+            ++g_NativeSetFOVMatches;
+            onlyMatch = reinterpret_cast<uintptr_t>(p);
+        }
+    }
+
+    g_ServerBase = module.base;
+
+    if (g_NativeSetFOVMatches != 1 || onlyMatch == 0)
+    {
+        ConColorMsg(Color(255, 150, 50, 255),
+            "[VIP-FOVNative] native SetFOV signature matches=%d; native path disabled.\n",
+            g_NativeSetFOVMatches);
+        return false;
+    }
+
+    g_NativeSetFOVRVA = onlyMatch - module.base;
+    g_pNativeSetFOV = reinterpret_cast<NativeSetFOVFn>(onlyMatch);
+
+    ConColorMsg(Color(80, 220, 120, 255),
+        "[VIP-FOVNative] native CameraServices SetFOV found: libserver.so+0x%lX (1 unique match).\n",
+        static_cast<unsigned long>(g_NativeSetFOVRVA));
+
+    return true;
+}
+#else
+static bool ResolveNativeSetFOV()
+{
+    ConColorMsg(Color(255, 150, 50, 255),
+        "[VIP-FOVNative] native SetFOV scanner in this build is Linux-only.\n");
+    return false;
+}
+#endif
+
+// -----------------------------------------------------------------------------
+// FOV application
+// -----------------------------------------------------------------------------
+static bool ApplyRawCameraFOVFallback(int slot, int value)
+{
+    // Fallback is intentionally the exact CameraServices-only mechanism from
+    // the diagnostic build that the user confirmed visually worked. It does
+    // NOT touch m_iDesiredFOV or any viewmodel field.
     CEntityInstance* pawn = GetPawn(slot);
     void* camera = GetCameraServices(slot);
+
     if (!pawn || !camera || g_iCameraFOVOffset < 0 || g_iCameraFOVStartOffset < 0)
         return false;
 
-    *reinterpret_cast<uint32_t*>(
-        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVOffset)
-    ) = static_cast<uint32_t>(value);
-
-    *reinterpret_cast<uint32_t*>(
-        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVStartOffset)
-    ) = static_cast<uint32_t>(value);
+    *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(camera) + g_iCameraFOVOffset) = value;
+    *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(camera) + g_iCameraFOVStartOffset) = value;
 
     if (g_iCameraFOVRateOffset >= 0)
     {
         *reinterpret_cast<float*>(
-            reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVRateOffset)
-        ) = 0.0f;
+            reinterpret_cast<uintptr_t>(camera) + g_iCameraFOVRateOffset) = 0.0f;
     }
 
-    // Camera services are networked through the pawn. Mark the owning
-    // networked service pointer dirty so the service state is serialized.
     if (g_pUtils)
     {
         g_pUtils->SetStateChanged(
@@ -318,290 +470,164 @@ static bool SetCameraFOV(int slot, int value)
     return true;
 }
 
-static int ReadCameraFOV(int slot)
+static bool ApplyCameraFOVNow(int slot, int value)
 {
-    if (g_iCameraFOVOffset < 0)
-        ResolveOffsets();
+    if (slot < 0 || slot >= 64 || value <= 0)
+        return false;
 
-    void* camera = GetCameraServices(slot);
-    if (!camera || g_iCameraFOVOffset < 0)
-        return 0;
-
-    return static_cast<int>(*reinterpret_cast<uint32_t*>(
-        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVOffset)
-    ));
-}
-
-static int ReadCameraFOVStart(int slot)
-{
-    if (g_iCameraFOVStartOffset < 0)
-        ResolveOffsets();
-
-    void* camera = GetCameraServices(slot);
-    if (!camera || g_iCameraFOVStartOffset < 0)
-        return 0;
-
-    return static_cast<int>(*reinterpret_cast<uint32_t*>(
-        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVStartOffset)
-    ));
-}
-
-static float ReadPawnFloat(int slot, int offset)
-{
     CEntityInstance* pawn = GetPawn(slot);
-    if (!pawn || offset < 0)
-        return 0.0f;
+    void* camera = GetCameraServices(slot);
+    if (!pawn || !camera)
+        return false;
 
-    return *reinterpret_cast<float*>(
-        reinterpret_cast<uintptr_t>(pawn) + static_cast<uintptr_t>(offset)
-    );
-}
-
-static bool SetViewmodelOffsets(int slot, float x, float y, float z)
-{
-    if (g_iViewmodelOffsetXOffset < 0 ||
-        g_iViewmodelOffsetYOffset < 0 ||
-        g_iViewmodelOffsetZOffset < 0)
+    if (g_pNativeSetFOV)
     {
-        ResolveOffsets();
+        // startFOV=value deliberately reproduces the diagnostic camera=120/120
+        // state that was observed to pull back both camera and weapon.
+        return g_pNativeSetFOV(camera, pawn, value, value, 0.0f);
     }
 
+    return ApplyRawCameraFOVFallback(slot, value);
+}
+
+static bool ResetCameraFOVNow(int slot)
+{
     CEntityInstance* pawn = GetPawn(slot);
-    if (!pawn || !g_pUtils ||
-        g_iViewmodelOffsetXOffset < 0 ||
-        g_iViewmodelOffsetYOffset < 0 ||
-        g_iViewmodelOffsetZOffset < 0)
-    {
-        return false;
-    }
-
-    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetXOffset) = x;
-    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetYOffset) = y;
-    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetZOffset) = z;
-
-    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetX");
-    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetY");
-    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetZ");
-    return true;
-}
-
-static bool SetWorldFOV(int slot, int value)
-{
-    if (g_iDesiredFOVOffset < 0)
-        ResolveOffsets();
-
-    if (g_iDesiredFOVOffset < 0 || !g_pUtils)
+    void* camera = GetCameraServices(slot);
+    if (!pawn || !camera)
         return false;
 
-    CEntityInstance* controller = GetController(slot);
-    if (!controller)
+    if (g_pNativeSetFOV)
+        return g_pNativeSetFOV(camera, pawn, 0, 0, 0.0f);
+
+    return ApplyRawCameraFOVFallback(slot, 0);
+}
+
+static bool CameraNeedsRepair(int slot, int target)
+{
+    if (target <= 0)
         return false;
 
-    *reinterpret_cast<int*>(
-        reinterpret_cast<uintptr_t>(controller) +
-        static_cast<uintptr_t>(g_iDesiredFOVOffset)
-    ) = value;
-
-    g_pUtils->SetStateChanged(
-        reinterpret_cast<CBaseEntity*>(controller),
-        "CBasePlayerController",
-        "m_iDesiredFOV"
-    );
-
-    return true;
+    return ReadCameraFOV(slot) != target || ReadCameraFOVStart(slot) != target;
 }
 
-static bool SetViewmodelFOV(int slot, float value)
-{
-    if (g_iViewmodelFOVOffset < 0)
-        ResolveOffsets();
-
-    if (g_iViewmodelFOVOffset < 0 || !g_pUtils)
-        return false;
-
-    CEntityInstance* pawn = GetPawn(slot);
-    if (!pawn)
-        return false;
-
-    *reinterpret_cast<float*>(
-        reinterpret_cast<uintptr_t>(pawn) +
-        static_cast<uintptr_t>(g_iViewmodelFOVOffset)
-    ) = value;
-
-    g_pUtils->SetStateChanged(
-        reinterpret_cast<CBaseEntity*>(pawn),
-        "CCSPlayerPawn",
-        "m_flViewmodelFOV"
-    );
-
-    return true;
-}
-
-static int ReadWorldFOV(int slot)
-{
-    if (g_iDesiredFOVOffset < 0)
-        ResolveOffsets();
-
-    CEntityInstance* controller = GetController(slot);
-    if (!controller || g_iDesiredFOVOffset < 0)
-        return 0;
-
-    return *reinterpret_cast<int*>(
-        reinterpret_cast<uintptr_t>(controller) +
-        static_cast<uintptr_t>(g_iDesiredFOVOffset)
-    );
-}
-
-static float ReadViewmodelFOV(int slot)
-{
-    if (g_iViewmodelFOVOffset < 0)
-        ResolveOffsets();
-
-    CEntityInstance* pawn = GetPawn(slot);
-    if (!pawn || g_iViewmodelFOVOffset < 0)
-        return 0.0f;
-
-    return *reinterpret_cast<float*>(
-        reinterpret_cast<uintptr_t>(pawn) +
-        static_cast<uintptr_t>(g_iViewmodelFOVOffset)
-    );
-}
-
-static void AutoOffsetsForFOV(int worldFOV, float& x, float& y, float& z)
-{
-    const float extra = std::max(0.0f, static_cast<float>(worldFOV) - kBaseWorldFOV);
-
-    // Tuned as a practical server-side replacement for client viewmodel FOV.
-    //  90 -> 2.50 / 2.00 / -2.00
-    // 120 -> 2.50 / 5.60 / -2.60
-    // 150 -> 2.50 / 9.20 / -3.20
-    x = kBaseViewX;
-    y = kBaseViewY + extra * 0.12f;
-    z = kBaseViewZ - extra * 0.02f;
-}
-
-static void SaveFOVCookieIfVIP(int slot, int worldFOV)
-{
-    if (!g_pVIPCore || slot < 0 || slot >= 64 || worldFOV <= 0)
-        return;
-
-    if (!g_pVIPCore->VIP_IsClientVIP(slot))
-        return;
-
-    const std::string value = std::to_string(worldFOV);
-    g_pVIPCore->VIP_SetClientCookie(slot, "FOV_Value", value.c_str());
-}
-
-static bool ApplyPlayerFOVState(int slot)
+static bool EnsureTargetFOV(int slot, bool countRepair)
 {
     if (slot < 0 || slot >= 64)
         return false;
 
-    PlayerFOVState& state = g_PlayerFOV[slot];
-    if (!state.enabled || state.worldFOV <= 0)
+    const int target = g_TargetFOV[slot];
+    if (target <= 0)
         return false;
 
-    // World FOV is still applied server-side. The local CS2 viewmodel ignores
-    // the pawn m_flViewmodelFOV/Offset network fields, so try the engine's
-    // native ClientCommand path for the exact client-side debug FOV.
-    const bool desiredOk = SetWorldFOV(slot, state.worldFOV);
-    const bool cameraOk = SetCameraFOV(slot, state.worldFOV);
-    const bool clientOk = SendClientDebugFOV(slot, state.worldFOV);
+    if (!CameraNeedsRepair(slot, target))
+        return true;
 
-    if (!desiredOk || !cameraOk || !clientOk)
-    {
-        ConColorMsg(
-            Color(255, 180, 50, 255),
-            "[VIP-FOVWeapon] apply slot %d: desired=%d camera=%d clientcmd=%d FOV=%d\n",
-            slot,
-            desiredOk ? 1 : 0,
-            cameraOk ? 1 : 0,
-            clientOk ? 1 : 0,
-            state.worldFOV
-        );
-    }
-
-    return desiredOk && cameraOk && clientOk;
+    const bool ok = ApplyCameraFOVNow(slot, target);
+    if (ok && countRepair)
+        ++g_AutoFixCount[slot];
+    return ok;
 }
 
-static bool SetPlayerFOVTarget(int slot, int worldFOV, bool saveCookie)
+static void BurstFrame(int slot, uint32_t generation, int framesLeft)
 {
-    if (slot < 0 || slot >= 64 || worldFOV <= 0)
-        return false;
-
-    PlayerFOVState& state = g_PlayerFOV[slot];
-    state.worldFOV = worldFOV;
-    state.enabled = true;
-
-    if (!state.customOffsets)
-        AutoOffsetsForFOV(worldFOV, state.viewX, state.viewY, state.viewZ);
-
-    if (saveCookie)
-        SaveFOVCookieIfVIP(slot, worldFOV);
-
-    return ApplyPlayerFOVState(slot);
-}
-
-static void ReapplyBurstFrame(int slot, int remaining)
-{
-    if (!g_pUtils || slot < 0 || slot >= 64 || remaining <= 0)
+    if (!g_pUtils || slot < 0 || slot >= 64 || framesLeft <= 0)
         return;
 
-    g_pUtils->NextFrame([slot, remaining]()
+    if (generation != g_BurstGeneration[slot] || g_TargetFOV[slot] <= 0)
+        return;
+
+    EnsureTargetFOV(slot, true);
+
+    g_pUtils->NextFrame([slot, generation, framesLeft]()
     {
-        if (slot < 0 || slot >= 64 || !g_PlayerFOV[slot].enabled)
-            return;
-
-        ApplyPlayerFOVState(slot);
-
-        if (remaining > 1)
-            ReapplyBurstFrame(slot, remaining - 1);
+        BurstFrame(slot, generation, framesLeft - 1);
     });
 }
 
-static void ReapplyPlayerFOV(int slot)
+static void StartRepairBurst(int slot, int frames = 32)
 {
-    if (slot < 0 || slot >= 64 || !g_PlayerFOV[slot].enabled)
+    if (!g_pUtils || slot < 0 || slot >= 64 || g_TargetFOV[slot] <= 0)
         return;
 
-    // Weapon changes can rewrite camera/viewmodel state over several frames.
-    // A short 6-frame burst is still event-driven (not every tick forever),
-    // while being much harder for the engine's weapon setup to overwrite.
-    ApplyPlayerFOVState(slot);
-    ReapplyBurstFrame(slot, 6);
+    const uint32_t generation = ++g_BurstGeneration[slot];
+    g_pUtils->NextFrame([slot, generation, frames]()
+    {
+        BurstFrame(slot, generation, frames);
+    });
 }
 
+static float WatchdogTick()
+{
+    for (int slot = 0; slot < 64; ++slot)
+    {
+        if (g_TargetFOV[slot] <= 0)
+            continue;
+
+        EnsureTargetFOV(slot, true);
+    }
+
+    // Pisex Utils timers use the returned positive value as the next interval.
+    return 0.05f;
+}
+
+static void StartWatchdog()
+{
+    if (!g_pUtils || g_pWatchdogTimer)
+        return;
+
+    g_pWatchdogTimer = g_pUtils->CreateTimer(0.05f, WatchdogTick);
+}
+
+static void StopWatchdog()
+{
+    if (!g_pUtils || !g_pWatchdogTimer)
+        return;
+
+    g_pUtils->RemoveTimer(g_pWatchdogTimer);
+    g_pWatchdogTimer = nullptr;
+}
+
+static bool SetTargetFOV(int slot, int value, bool burst = true)
+{
+    if (slot < 0 || slot >= 64 || value <= 0)
+        return false;
+
+    g_TargetFOV[slot] = value;
+
+    const bool ok = ApplyCameraFOVNow(slot, value);
+    if (burst)
+        StartRepairBurst(slot, 32);
+    return ok;
+}
+
+static void ClearTargetFOV(int slot, bool resetGameFOV)
+{
+    if (slot < 0 || slot >= 64)
+        return;
+
+    g_TargetFOV[slot] = 0;
+    ++g_BurstGeneration[slot];
+
+    if (resetGameFOV)
+        ResetCameraFOVNow(slot);
+}
+
+// -----------------------------------------------------------------------------
+// Events / commands
+// -----------------------------------------------------------------------------
 static void OnWeaponFOVResetEvent(const char*, IGameEvent* event, bool)
 {
     if (!event)
         return;
 
     const int slot = event->GetPlayerSlot("userid").Get();
-    if (slot < 0 || slot >= 64 || !g_PlayerFOV[slot].enabled)
+    if (slot < 0 || slot >= 64 || g_TargetFOV[slot] <= 0)
         return;
 
-    ReapplyPlayerFOV(slot);
-}
-
-static void SplitList(const char* text, std::vector<std::string>& output)
-{
-    output.clear();
-
-    if (!text || !text[0])
-        return;
-
-    std::stringstream stream(text);
-    std::string token;
-
-    while (std::getline(stream, token, ','))
-    {
-        // Trim basic spaces around comma-separated values.
-        const std::size_t first = token.find_first_not_of(" \t\r\n");
-        const std::size_t last = token.find_last_not_of(" \t\r\n");
-
-        if (first != std::string::npos)
-            output.push_back(token.substr(first, last - first + 1));
-    }
+    // Weapon deploy/reset can happen several frames after the event. The burst
+    // checks each frame but calls SetFOV only if CS2 actually changed the value.
+    StartRepairBurst(slot, 40);
 }
 
 static std::string LastToken(const char* text)
@@ -612,278 +638,108 @@ static std::string LastToken(const char* text)
     std::stringstream ss(text);
     std::string token;
     std::string last;
-
     while (ss >> token)
         last = token;
-
     return last;
 }
 
-static std::vector<std::string> Tokens(const char* text)
+static void SplitList(const char* text, std::vector<std::string>& output)
 {
-    std::vector<std::string> out;
-    if (!text)
-        return out;
+    output.clear();
+    if (!text || !text[0])
+        return;
 
-    std::stringstream ss(text);
+    std::stringstream stream(text);
     std::string token;
-    while (ss >> token)
-        out.push_back(token);
-    return out;
-}
-
-// Optional debug/test command: !fovweapon 110
-static bool CommandFOVWeapon(int slot, const char* content)
-{
-    // Debug command intentionally bypasses VIP access checks.
-    // The actual selectable VIP feature/menu remains VIP-only via VIP Core.
-    if (!g_pUtils)
-        return true;
-
-    const std::string token = LastToken(content);
-
-    if (token.empty() || token == "mm_fovweapon" || token == "!fovweapon")
+    while (std::getline(stream, token, ','))
     {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovweapon 110");
-        return true;
+        const std::size_t first = token.find_first_not_of(" \t\r\n");
+        const std::size_t last = token.find_last_not_of(" \t\r\n");
+        if (first != std::string::npos)
+            output.push_back(token.substr(first, last - first + 1));
     }
-
-    const int value = std::strtol(token.c_str(), nullptr, 10);
-    if (value <= 0)
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Invalid value.");
-        return true;
-    }
-
-    // Do NOT touch the VIP cookie from a debug command. This prevents a saved
-    // menu value (for example 150) from fighting the requested test value.
-    if (!SetPlayerFOVTarget(slot, value, false))
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Failed. Check server console.");
-        return true;
-    }
-
-    ReapplyPlayerFOV(slot);
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] requested=%d target=%d world=%d camera=%d/%d client=fov_cs_debug",
-        value,
-        g_PlayerFOV[slot].worldFOV,
-        ReadWorldFOV(slot),
-        ReadCameraFOV(slot),
-        ReadCameraFOVStart(slot)
-    );
-    return true;
 }
 
 static bool CommandFOVCam(int slot, const char* content)
 {
-    if (!g_pUtils)
-        return true;
-
-    const std::string token = LastToken(content);
-
-    if (token == "off" || token == "0")
-    {
-        if (slot >= 0 && slot < 64)
-            g_PlayerFOV[slot] = PlayerFOVState{};
-        g_pUtils->PrintToChat(slot, "[FOV] persistent FOV/weapon reapply disabled");
-        return true;
-    }
-
-    const int value = std::strtol(token.c_str(), nullptr, 10);
-
-    if (value <= 0)
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120 (or !fovcam off)");
-        return true;
-    }
-
-    // Debug command uses runtime state only; it intentionally does not write the VIP cookie.
-    if (!SetPlayerFOVTarget(slot, value, false))
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] CameraServices write failed. See server console.");
-        return true;
-    }
-
-    ReapplyPlayerFOV(slot);
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] camera=%d/%d world=%d weaponXYZ=%.2f %.2f %.2f",
-        ReadCameraFOV(slot),
-        ReadCameraFOVStart(slot),
-        ReadWorldFOV(slot),
-        g_PlayerFOV[slot].viewX,
-        g_PlayerFOV[slot].viewY,
-        g_PlayerFOV[slot].viewZ
-    );
-    return true;
-}
-
-static bool CommandFOVOffset(int slot, const char* content)
-{
-    if (!g_pUtils)
-        return true;
-
-    const auto tokens = Tokens(content);
-    if (tokens.size() < 3)
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovoffset 2.5 2 -2");
-        return true;
-    }
-
-    const float x = std::strtof(tokens[tokens.size() - 3].c_str(), nullptr);
-    const float y = std::strtof(tokens[tokens.size() - 2].c_str(), nullptr);
-    const float z = std::strtof(tokens[tokens.size() - 1].c_str(), nullptr);
-
-    std::ostringstream cmd;
-    cmd << "viewmodel_offset_x " << x
-        << "; viewmodel_offset_y " << y
-        << "; viewmodel_offset_z " << z;
-
-    const bool clientOk = SendClientConsoleCommand(slot, cmd.str());
-
-    // Also write the server pawn fields only so !fovdiag can compare both paths.
-    SetViewmodelOffsets(slot, x, y, z);
-
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] client viewmodel offsets sent=%s X=%.2f Y=%.2f Z=%.2f",
-        clientOk ? "yes" : "no",
-        x, y, z
-    );
-    return true;
-}
-
-static bool CommandClientFOV(int slot, const char* content)
-{
-    if (!g_pUtils)
-        return true;
-
-    const std::string token = LastToken(content);
-    const int value = std::strtol(token.c_str(), nullptr, 10);
-    if (value <= 0)
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !clientfov 120");
-        return true;
-    }
-
-    const bool ok = SendClientDebugFOV(slot, value);
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] sent client command: fov_cs_debug %d (%s)",
-        value,
-        ok ? "entity accepted" : "failed"
-    );
-    return true;
-}
-
-static bool CommandClientVM(int slot, const char* content)
-{
-    if (!g_pUtils)
-        return true;
-
-    const std::string token = LastToken(content);
-    const float value = std::strtof(token.c_str(), nullptr);
-    if (value <= 0.0f)
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !clientvm 54");
-        return true;
-    }
-
-    const bool ok = SendClientViewmodelFOV(slot, value);
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] sent client command: viewmodel_fov %.2f (%s)",
-        value,
-        ok ? "entity accepted" : "failed"
-    );
-    return true;
-}
-
-static bool CommandFOVAuto(int slot, const char*)
-{
     if (!g_pUtils || slot < 0 || slot >= 64)
         return true;
 
-    int fov = g_PlayerFOV[slot].worldFOV;
-    if (fov <= 0)
-        fov = ReadWorldFOV(slot);
-    if (fov <= 0)
-        fov = 90;
+    const std::string token = LastToken(content);
+    if (token == "off" || token == "0")
+    {
+        ClearTargetFOV(slot, true);
+        g_pUtils->PrintToChat(slot, "[FOV] override OFF; game FOV restored");
+        return true;
+    }
 
-    g_PlayerFOV[slot].worldFOV = fov;
-    g_PlayerFOV[slot].enabled = true;
-    const bool ok = ApplyPlayerFOVState(slot);
+    const int value = std::strtol(token.c_str(), nullptr, 10);
+    if (value < 60 || value > 179)
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120 (60..179) or !fovcam off");
+        return true;
+    }
+
+    if (!SetTargetFOV(slot, value, true))
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] SetFOV failed. Check server console / !fovdiag");
+        return true;
+    }
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] re-applied world+client debug FOV=%d (%s)",
-        fov,
-        ok ? "ok" : "partial/failed"
+        "[FOV] target=%d camera=%d/%d native=%s",
+        value,
+        ReadCameraFOV(slot),
+        ReadCameraFOVStart(slot),
+        g_pNativeSetFOV ? "yes" : "fallback"
     );
     return true;
 }
 
 static bool CommandFOVDiag(int slot, const char*)
 {
-    if (!g_pUtils)
+    if (!g_pUtils || slot < 0 || slot >= 64)
         return true;
 
-    ResolveOffsets();
+    void* camera = GetCameraServices(slot);
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] world=%d vmFOV=%.2f cam=%d/%d",
-        ReadWorldFOV(slot),
-        ReadViewmodelFOV(slot),
+        "[FOV] target=%d cam=%d/%d rate=%.3f time=%.3f fixes=%llu",
+        g_TargetFOV[slot],
         ReadCameraFOV(slot),
-        ReadCameraFOVStart(slot)
+        ReadCameraFOVStart(slot),
+        ReadCameraFOVRate(slot),
+        ReadCameraFOVTime(slot),
+        static_cast<unsigned long long>(g_AutoFixCount[slot])
     );
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] server vmXYZ=%.2f %.2f %.2f target=%d (local render is client-side)",
-        ReadPawnFloat(slot, g_iViewmodelOffsetXOffset),
-        ReadPawnFloat(slot, g_iViewmodelOffsetYOffset),
-        ReadPawnFloat(slot, g_iViewmodelOffsetZOffset),
-        (slot >= 0 && slot < 64) ? g_PlayerFOV[slot].worldFOV : 0
+        "[FOV] native=%s matches=%d rva=0x%lX desired(read-only)=%d",
+        g_pNativeSetFOV ? "YES" : "NO/fallback",
+        g_NativeSetFOVMatches,
+        static_cast<unsigned long>(g_NativeSetFOVRVA),
+        ReadDesiredFOV(slot)
     );
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] schema desired=0x%X vm=0x%X camPtr=0x%X camFOV=0x%X",
-        g_iDesiredFOVOffset,
-        g_iViewmodelFOVOffset,
+        "[FOV] cameraPtr=%s schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
+        camera ? "OK" : "NULL",
         g_iCameraServicesOffset,
-        g_iCameraFOVOffset
+        g_iCameraFOVOffset,
+        g_iCameraFOVStartOffset,
+        g_iCameraZoomOwnerOffset
     );
 
     return true;
 }
 
-static bool CommandFOVInfo(int slot, const char*)
-{
-    if (g_iDesiredFOVOffset < 0 ||
-        g_iPlayerPawnHandleOffset < 0 ||
-        g_iViewmodelFOVOffset < 0)
-    {
-        ResolveOffsets();
-    }
-
-    g_pUtils->PrintToChat(
-        slot,
-        "[FOV] world=%d viewmodel=%.2f offsets=[desired:0x%X pawn:0x%X vm:0x%X]",
-        ReadWorldFOV(slot),
-        ReadViewmodelFOV(slot),
-        g_iDesiredFOVOffset,
-        g_iPlayerPawnHandleOffset,
-        g_iViewmodelFOVOffset
-    );
-
-    return true;
-}
-
+// -----------------------------------------------------------------------------
+// Metamod / VIP lifecycle
+// -----------------------------------------------------------------------------
 bool VIPFovWeapon::Load(
     PluginId id,
     ISmmAPI* ismm,
@@ -913,6 +769,8 @@ bool VIPFovWeapon::Load(
 
 bool VIPFovWeapon::Unload(char* error, size_t maxlen)
 {
+    StopWatchdog();
+
     if (g_pUtils)
         g_pUtils->ClearAllHooks(g_PLID);
 
@@ -921,9 +779,15 @@ bool VIPFovWeapon::Unload(char* error, size_t maxlen)
 
 static void OnStartupServer()
 {
+    if (!g_pUtils)
+        return;
+
     g_pGameEntitySystem = g_pUtils->GetCGameEntitySystem();
     g_pEntitySystem = g_pUtils->GetCEntitySystem();
+
     ResolveOffsets();
+    ResolveNativeSetFOV();
+    StartWatchdog();
 }
 
 static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
@@ -932,18 +796,28 @@ static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
         return;
 
     g_FOV[slot].clear();
-    g_PlayerFOV[slot] = PlayerFOVState{};
+    g_TargetFOV[slot] = 0;
+    g_AutoFixCount[slot] = 0;
+    ++g_BurstGeneration[slot];
 
     if (!isVIP || !g_pVIPCore)
         return;
 
-    SplitList(
-        g_pVIPCore->VIP_GetClientFeatureString(slot, "FOV"),
-        g_FOV[slot]
-    );
+    SplitList(g_pVIPCore->VIP_GetClientFeatureString(slot, "FOV"), g_FOV[slot]);
 }
 
-static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int team, bool isVIP)
+static void VIP_OnClientDisconnect_FOVWeapon(int slot, bool)
+{
+    if (slot < 0 || slot >= 64)
+        return;
+
+    g_FOV[slot].clear();
+    g_TargetFOV[slot] = 0;
+    g_AutoFixCount[slot] = 0;
+    ++g_BurstGeneration[slot];
+}
+
+static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int, bool isVIP)
 {
     if (slot < 0 || slot >= 64 || !isVIP || !g_pVIPCore || !g_pUtils)
         return;
@@ -951,24 +825,17 @@ static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int team, bool isVIP)
     if (g_FOV[slot].empty())
         return;
 
-    const char* cookie =
-        g_pVIPCore->VIP_GetClientCookie(slot, "FOV_Value");
+    const char* cookie = g_pVIPCore->VIP_GetClientCookie(slot, "FOV_Value");
+    const int selected = (cookie && cookie[0]) ? std::strtol(cookie, nullptr, 10) : 90;
 
-    const int worldFOV =
-        (cookie && cookie[0]) ? std::strtol(cookie, nullptr, 10) : 90;
+    if (selected < 60 || selected > 179)
+        return;
 
-    // Load the saved VIP value into the same authoritative state used by
-    // commands/menu, then re-apply after the new pawn exists.
-    PlayerFOVState& state = g_PlayerFOV[slot];
-    state.worldFOV = worldFOV;
-    state.enabled = true;
-    state.customOffsets = false;
-    AutoOffsetsForFOV(worldFOV, state.viewX, state.viewY, state.viewZ);
+    g_TargetFOV[slot] = selected;
 
-    g_pUtils->NextFrame([slot]()
-    {
-        ReapplyPlayerFOV(slot);
-    });
+    // New pawn/services may not exist until the following frame. The burst is
+    // deliberately long enough to cover spawn + initial weapon deploy resets.
+    StartRepairBurst(slot, 64);
 }
 
 static bool OpenFOVMenu(int slot, const char*)
@@ -999,15 +866,11 @@ static bool OpenFOVMenu(int slot, const char*)
 
             if (item < static_cast<int>(g_FOV[slot].size()))
             {
-                const int worldFOV = std::strtol(back, nullptr, 10);
-
-                if (worldFOV > 0)
+                const int value = std::strtol(back, nullptr, 10);
+                if (value >= 60 && value <= 179)
                 {
-                    // Menu selection becomes the persistent VIP FOV value.
-                    g_PlayerFOV[slot].customOffsets = false;
-                    SetPlayerFOVTarget(slot, worldFOV, false);
-                    SaveFOVCookieIfVIP(slot, worldFOV);
-                    ReapplyPlayerFOV(slot);
+                    SetTargetFOV(slot, value, true);
+                    g_pVIPCore->VIP_SetClientCookie(slot, "FOV_Value", strdup(back));
                 }
 
                 OpenFOVMenu(slot, "FOV");
@@ -1028,151 +891,55 @@ void VIPFovWeapon::AllPluginsLoaded()
     int ret = 0;
 
     g_pUtils = reinterpret_cast<IUtilsApi*>(
-        g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, nullptr)
-    );
-
+        g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pUtils)
     {
-        ConColorMsg(
-            Color(255, 0, 0, 255),
-            "[VIP-FOVWeapon] Utils API not found.\n"
-        );
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVNative] Utils API not found.\n");
         return;
     }
 
     g_pMenus = reinterpret_cast<IMenusApi*>(
-        g_SMAPI->MetaFactory(Menus_INTERFACE, &ret, nullptr)
-    );
-
+        g_SMAPI->MetaFactory(Menus_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pMenus)
     {
-        ConColorMsg(
-            Color(255, 0, 0, 255),
-            "[VIP-FOVWeapon] Menus API not found.\n"
-        );
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVNative] Menus API not found.\n");
         return;
     }
 
     g_pVIPCore = reinterpret_cast<IVIPApi*>(
-        g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, nullptr)
-    );
-
+        g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pVIPCore)
     {
-        ConColorMsg(
-            Color(255, 0, 0, 255),
-            "[VIP-FOVWeapon] VIP Core not found.\n"
-        );
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVNative] VIP Core not found.\n");
         return;
     }
 
-    // Debug commands are useful for checking whether the current CS2 build
-    // still exposes/replicates both schema fields.
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovweapon"},
-        {"!fovweapon"},
-        CommandFOVWeapon
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovweapon_info"},
-        {"!fovweaponinfo"},
-        CommandFOVInfo
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovcam"},
-        {"!fovcam"},
-        CommandFOVCam
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovoffset"},
-        {"!fovoffset"},
-        CommandFOVOffset
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovauto"},
-        {"!fovauto"},
-        CommandFOVAuto
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovexact"},
-        {"!fovexact"},
-        CommandFOVWeapon
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_clientfov"},
-        {"!clientfov"},
-        CommandClientFOV
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_clientvm"},
-        {"!clientvm"},
-        CommandClientVM
-    );
-
-    g_pUtils->RegCommand(
-        g_PLID,
-        {"mm_fovdiag"},
-        {"!fovdiag", "!fovinfo"},
-        CommandFOVDiag
-    );
+    // Keep the one debug command the user already verified, but it now uses
+    // the native SetFOV path and becomes persistent.
+    g_pUtils->RegCommand(g_PLID, {"mm_fovcam"}, {"!fovcam", "!realfov"}, CommandFOVCam);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovdiag"}, {"!fovdiag", "!fovinfo"}, CommandFOVDiag);
 
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
-
-    // Both event names are present in the supplied libserver.so. Different
-    // weapon transitions can use either path, so hook both.
     g_pUtils->HookEvent(g_PLID, "weapon_switch", OnWeaponFOVResetEvent);
     g_pUtils->HookEvent(g_PLID, "item_equip", OnWeaponFOVResetEvent);
 
     g_pVIPCore->VIP_OnClientLoaded(VIP_OnClientLoaded_FOVWeapon);
+    g_pVIPCore->VIP_OnClientDisconnect(VIP_OnClientDisconnect_FOVWeapon);
     g_pVIPCore->VIP_OnPlayerSpawn(VIP_OnPlayerSpawn_FOVWeapon);
 
-    // Keep the original VIP_FOV feature/cookie names, so groups.ini can stay:
-    // "FOV" "90,100,110,120"
-    g_pVIPCore->VIP_RegisterFeature(
-        "FOV",
-        VIP_STRING,
-        SELECTABLE,
-        OpenFOVMenu
-    );
+    g_pVIPCore->VIP_RegisterFeature("FOV", VIP_STRING, SELECTABLE, OpenFOVMenu);
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] v2.1-safeclient loaded: world FOV + IVEngineServer2::ClientCommand test. Commands: !fovexact !clientfov !clientvm !fovdiag\n"
+        "[VIP-FOVNative] loaded. CameraServices-only native FOV; no desiredFOV/viewmodel/client-command writes. Commands: !fovcam !fovdiag\n"
     );
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "2.0-clientcmd"; }
+const char* VIPFovWeapon::GetVersion() { return "2.0-native"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
-const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVWeapon]"; }
-const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmodel adaptation"; }
-
-const char* VIPFovWeapon::GetDescription()
-{
-    return "VIP world FOV plus safe client-command delivery through IVEngineServer2::ClientCommand.";
-}
-
-const char* VIPFovWeapon::GetName()
-{
-    return "[VIP] FOV + Client Viewmodel";
-}
-
-const char* VIPFovWeapon::GetURL()
-{
-    return "https://github.com/Pisex/cs2-vip-modules";
-}
+const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVNative]"; }
+const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + native CameraServices SetFOV"; }
+const char* VIPFovWeapon::GetDescription() { return "Persistent VIP FOV through native libserver CameraServices SetFOV."; }
+const char* VIPFovWeapon::GetName() { return "[VIP] Native FOV + Weapon"; }
+const char* VIPFovWeapon::GetURL() { return "https://github.com/Pisex/cs2-vip-modules"; }
