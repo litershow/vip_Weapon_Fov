@@ -25,7 +25,7 @@ IMenusApi* g_pMenus = nullptr;
 IUtilsApi* g_pUtils = nullptr;
 
 IVEngineServer2* engine = nullptr;
-static ISource2Server* g_pSource2Server = nullptr;
+static ISource2Server* s_pFovSource2Server = nullptr;
 static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
@@ -675,7 +675,7 @@ static bool CommandFOVDiag(int slot, const char*)
         slot,
         "[FOV3] native-scan=disabled desired(read-only)=%d postGameFrame=%s",
         ReadDesiredFOV(slot),
-        g_pSource2Server ? "YES" : "NO"
+        s_pFovSource2Server ? "YES" : "NO"
     );
 
     g_pUtils->PrintToChat(
@@ -719,17 +719,17 @@ bool VIPFovWeapon::Load(
 
     GET_V_IFACE_CURRENT(
         GetServerFactory,
-        g_pSource2Server,
+        s_pFovSource2Server,
         ISource2Server,
         SOURCE2SERVER_INTERFACE_VERSION
     );
 
-    if (g_pSource2Server)
+    if (s_pFovSource2Server)
     {
         SH_ADD_HOOK(
             IServerGameDLL,
             GameFrame,
-            g_pSource2Server,
+            s_pFovSource2Server,
             SH_MEMBER(this, &VIPFovWeapon::GameFrame),
             true
         );
@@ -741,12 +741,12 @@ bool VIPFovWeapon::Load(
 
 bool VIPFovWeapon::Unload(char* error, size_t maxlen)
 {
-    if (g_pSource2Server)
+    if (s_pFovSource2Server)
     {
         SH_REMOVE_HOOK(
             IServerGameDLL,
             GameFrame,
-            g_pSource2Server,
+            s_pFovSource2Server,
             SH_MEMBER(this, &VIPFovWeapon::GameFrame),
             true
         );
