@@ -38,6 +38,8 @@ for sdk_target in MMSPlugin.sdk_targets:
     binary.sources += [
         'vip_viewmodelfov.cpp',
         os.path.join('..', 'SchemaEntity', 'schemasystem.cpp'),
+        os.path.join('..', 'SchemaEntity', 'module.cpp'),
+        os.path.join('..', 'SchemaEntity', 'ctimer.cpp'),
     ]
 
     if cxx.target.arch == 'x86':

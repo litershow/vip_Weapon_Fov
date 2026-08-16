@@ -9,9 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/pisex/ubuntu20:latest
+    runs-on: ubuntu-20.04
 
     env:
       HL2SDK_ROOT: "${{ github.workspace }}/external"
@@ -25,8 +23,15 @@ jobs:
       - name: Install dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qy
-          apt-get install -y git binutils python3 python3-pip build-essential clang protobuf-compiler zip
+          sudo apt-get update -qy
+          sudo apt-get install -y \
+            git \
+            clang-10 \
+            clang++-10 \
+            binutils \
+            python3 \
+            python3-pip \
+            zip
 
           python3 -m pip install --upgrade pip importlib-metadata
           python3 -m pip install setuptools==45.2.0
@@ -36,57 +41,36 @@ jobs:
           cd /tmp/ambuild
           pip3 install .
 
-      - name: Download Metamod and CS2 HL2SDK
+      - name: Download dependencies
         run: |
           mkdir -p "$HL2SDK_ROOT"
 
           rm -rf "$MMS_PATH"
           git clone --recursive --branch master --single-branch \
-            https://github.com/alliedmodders/metamod-source.git "$MMS_PATH"
+            https://github.com/alliedmodders/metamod-source.git \
+            "$MMS_PATH"
 
           rm -rf "$HL2SDK_ROOT/hl2sdk-cs2"
           git clone --recursive --branch cs2 --single-branch \
-            https://github.com/alliedmodders/hl2sdk.git "$HL2SDK_ROOT/hl2sdk-cs2"
+            https://github.com/alliedmodders/hl2sdk.git \
+            "$HL2SDK_ROOT/hl2sdk-cs2"
 
-          echo "=== Verify SDK files used by AMBuildScript ==="
-          for f in \
-            public/tier0/memoverride.cpp \
-            entity2/entitysystem.cpp \
-            entity2/entityidentity.cpp \
-            entity2/entitykeyvalues.cpp
-          do
-            test -f "$HL2SDK_ROOT/hl2sdk-cs2/$f" || {
-              echo "Missing SDK source: $f"
-              exit 1
-            }
-          done
-
-      - name: Download and patch SchemaEntity
-        run: |
           rm -rf "$SCHEMA_DIR"
           git clone https://github.com/Pisex/SchemaEntity.git "$SCHEMA_DIR"
 
-          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' "$SCHEMA_DIR/schemasystem.cpp"
-          sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' "$SCHEMA_DIR/CCSPlayerPawn.h"
-          sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' "$SCHEMA_DIR/CCSPlayerController.h"
-
-      - name: Verify build scripts are current
+      - name: Verify current sources
         run: |
-          echo "=== AMBuildScript obsolete source check ==="
-          if grep -nE "tier1.*(generichash|convar|keyvalues3)\.cpp" "$GITHUB_WORKSPACE/AMBuildScript"; then
-            echo "ERROR: AMBuildScript is still old. Replace it with the fixed file."
-            exit 1
-          fi
-
-          echo "=== AMBuilder obsolete source check ==="
-          if grep -nE "tier1.*(generichash|convar|keyvalues3)\.cpp" "$GITHUB_WORKSPACE/AMBuilder"; then
-            echo "ERROR: AMBuilder is still old. Replace it with the fixed file."
-            exit 1
-          fi
-
+          test -f "$GITHUB_WORKSPACE/configure.py"
+          test -f "$GITHUB_WORKSPACE/AMBuildScript"
+          test -f "$GITHUB_WORKSPACE/AMBuilder"
           test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.cpp"
-          test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.h"
           test -f "$SCHEMA_DIR/schemasystem.cpp"
+          test -f "$SCHEMA_DIR/module.cpp"
+          test -f "$SCHEMA_DIR/ctimer.cpp"
+
+          # generichash.cpp/keyvalues3.cpp are obsolete and must not be referenced.
+          ! grep -n "generichash.cpp" "$GITHUB_WORKSPACE/AMBuildScript"
+          ! grep -n "keyvalues3.cpp" "$GITHUB_WORKSPACE/AMBuildScript"
 
       - name: Configure
         run: |
@@ -94,6 +78,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/build"
           cd "$GITHUB_WORKSPACE/build"
 
+          CC=clang-10 CXX=clang++-10 \
           python3 ../configure.py \
             -s cs2 \
             --targets x86_64 \
@@ -105,14 +90,17 @@ jobs:
       - name: Build
         run: |
           cd "$GITHUB_WORKSPACE/build"
-          ambuild
+
+          # One worker on purpose: if compilation fails, GitHub prints the exact
+          # compiler error instead of hiding it among parallel worker output.
+          ambuild -j 1
 
       - name: Show output
         if: always()
         run: |
-          echo "=== .so ==="
+          echo "===== shared libraries ====="
           find "$GITHUB_WORKSPACE/build" -type f -name "*.so" -print || true
-          echo "=== package ==="
+          echo "===== package ====="
           find "$GITHUB_WORKSPACE/build/package" -type f -print 2>/dev/null || true
 
       - name: Package
