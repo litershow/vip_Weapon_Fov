@@ -1,36 +1,49 @@
-name: Build VIP Weapon Fov
+name: Build VIP Weapon FOV
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     container:
       image: ghcr.io/pisex/ubuntu20:latest
 
     env:
-      HL2SDK_ROOT: ${{ github.workspace }}/external
-      MMS_PATH: ${{ github.workspace }}/external/metamod-source
+      HL2SDK_ROOT: "${{ github.workspace }}/external"
+      MMS_PATH: "${{ github.workspace }}/external/metamod-source"
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show repository layout
+      - name: Show repository structure
         run: |
-          echo "WORKSPACE=$GITHUB_WORKSPACE"
-          pwd
-          find "$GITHUB_WORKSPACE" -maxdepth 2 -type f | sort | head -200
+          echo "================================"
+          echo "WORKSPACE:"
+          echo "$GITHUB_WORKSPACE"
+          echo "================================"
 
-      - name: Install build tools
+          pwd
+
+          echo "===== FILES ====="
+          find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort | head -300
+
+      - name: Install dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+
           apt-get update -qy
+
           apt-get install -y \
             git \
             binutils \
@@ -41,62 +54,133 @@ jobs:
             protobuf-compiler \
             zip
 
-          python3 -m pip install --upgrade pip importlib-metadata
-          python3 -m pip install setuptools==45.2.0
+          python3 -m pip install --upgrade \
+            pip \
+            importlib-metadata
 
-          git clone https://github.com/alliedmodders/ambuild.git /tmp/ambuild
+          python3 -m pip install \
+            setuptools==45.2.0
+
+      - name: Install AMBuild
+        run: |
+          rm -rf /tmp/ambuild
+
+          git clone \
+            https://github.com/alliedmodders/ambuild.git \
+            /tmp/ambuild
+
           cd /tmp/ambuild
+
           pip3 install .
 
-      - name: Clone Metamod and HL2SDK
+          echo "===== AMBUILD ====="
+          which ambuild
+          ambuild --version || true
+
+      - name: Download Metamod Source
         run: |
           mkdir -p "$HL2SDK_ROOT"
 
-          git clone --recursive --branch master --single-branch \
+          rm -rf "$MMS_PATH"
+
+          git clone \
+            --recursive \
+            --branch master \
+            --single-branch \
             https://github.com/alliedmodders/metamod-source.git \
             "$MMS_PATH"
 
-          git clone --recursive --branch cs2 --single-branch \
+          echo "===== METAMOD ====="
+          ls -la "$MMS_PATH"
+
+      - name: Download CS2 HL2SDK
+        run: |
+          rm -rf "$HL2SDK_ROOT/hl2sdk-cs2"
+
+          git clone \
+            --recursive \
+            --branch cs2 \
+            --single-branch \
             https://github.com/alliedmodders/hl2sdk.git \
             "$HL2SDK_ROOT/hl2sdk-cs2"
 
-      - name: Clone SchemaEntity next to repository
+          echo "===== HL2SDK ====="
+          ls -la "$HL2SDK_ROOT/hl2sdk-cs2"
+
+          echo "===== ENTITY2 ====="
+          ls -la "$HL2SDK_ROOT/hl2sdk-cs2/entity2" || true
+
+          echo "===== TIER0 ====="
+          ls -la "$HL2SDK_ROOT/hl2sdk-cs2/public/tier0" || true
+
+      - name: Download SchemaEntity
         run: |
-          # AMBuilder in this project uses:
-          #   ../SchemaEntity
-          # relative to the repository source root.
           SCHEMA_DIR="$(dirname "$GITHUB_WORKSPACE")/SchemaEntity"
 
           rm -rf "$SCHEMA_DIR"
-          git clone https://github.com/Pisex/SchemaEntity.git "$SCHEMA_DIR"
 
-          # Compatibility fixes used by Pisex builds.
-          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' \
+          git clone \
+            https://github.com/Pisex/SchemaEntity.git \
+            "$SCHEMA_DIR"
+
+          echo "SchemaEntity location:"
+          echo "$SCHEMA_DIR"
+
+          echo "===== BEFORE PATCH ====="
+          ls -la "$SCHEMA_DIR" | head -100
+
+          # Fix compatibility with current SDK.
+          sed -i \
+            's/NetworkStateChanged_t/NetworkStateChangedData/g' \
             "$SCHEMA_DIR/schemasystem.cpp"
 
-          sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' \
+          sed -i \
+            's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' \
             "$SCHEMA_DIR/CCSPlayerPawn.h"
 
-          sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
+          sed -i \
+            's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
             "$SCHEMA_DIR/CCSPlayerController.h"
 
-          echo "SchemaEntity path: $SCHEMA_DIR"
-          ls -la "$SCHEMA_DIR" | head -50
+          echo "===== SCHEMA READY ====="
+          test -f "$SCHEMA_DIR/schemasystem.cpp"
+          test -f "$SCHEMA_DIR/CCSPlayerPawn.h"
+          test -f "$SCHEMA_DIR/CCSPlayerController.h"
 
-      - name: Verify source files
+      - name: Verify plugin files
         run: |
+          echo "===== VERIFY PLUGIN ====="
+
           test -f "$GITHUB_WORKSPACE/configure.py"
+          echo "configure.py OK"
+
           test -f "$GITHUB_WORKSPACE/AMBuildScript"
+          echo "AMBuildScript OK"
+
           test -f "$GITHUB_WORKSPACE/AMBuilder"
+          echo "AMBuilder OK"
+
           test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.cpp"
+          echo "vip_viewmodelfov.cpp OK"
+
           test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.h"
-          test -f "$GITHUB_WORKSPACE/hl2sdk-manifests/SdkHelpers.ambuild"
+          echo "vip_viewmodelfov.h OK"
+
+          test -d "$GITHUB_WORKSPACE/hl2sdk-manifests"
+          echo "hl2sdk-manifests OK"
+
+          echo "===== AMBUILDER ====="
+          cat "$GITHUB_WORKSPACE/AMBuilder"
 
       - name: Configure
         run: |
           rm -rf "$GITHUB_WORKSPACE/build"
+
           mkdir -p "$GITHUB_WORKSPACE/build"
+
           cd "$GITHUB_WORKSPACE/build"
+
+          echo "===== CONFIGURING ====="
 
           python3 ../configure.py \
             -s cs2 \
@@ -106,35 +190,99 @@ jobs:
             --mms_path="$MMS_PATH" \
             --hl2sdk-root="$HL2SDK_ROOT"
 
+          echo "===== CONFIGURE RESULT ====="
+          find . -maxdepth 3 -type f | sort | head -200
+
       - name: Build
         run: |
           cd "$GITHUB_WORKSPACE/build"
+
+          echo "================================"
+          echo "BUILDING VIP VIEWMODEL FOV"
+          echo "================================"
+
           ambuild
 
-      - name: Show output
+      - name: Show build output
         if: always()
         run: |
-          echo "=== shared libraries ==="
-          find "$GITHUB_WORKSPACE/build" -type f -name "*.so" -print || true
-          echo "=== package files ==="
-          find "$GITHUB_WORKSPACE/build/package" -type f -print 2>/dev/null || true
+          echo "================================"
+          echo "SHARED LIBRARIES"
+          echo "================================"
 
-      - name: Package artifact
+          find "$GITHUB_WORKSPACE/build" \
+            -type f \
+            -name "*.so" \
+            -print || true
+
+          echo "================================"
+          echo "VDF FILES"
+          echo "================================"
+
+          find "$GITHUB_WORKSPACE/build" \
+            -type f \
+            -name "*.vdf" \
+            -print || true
+
+          echo "================================"
+          echo "PACKAGE"
+          echo "================================"
+
+          find "$GITHUB_WORKSPACE/build/package" \
+            -type f \
+            -print 2>/dev/null || true
+
+      - name: Create package
         run: |
-          cd "$GITHUB_WORKSPACE/build"
+          rm -rf "$GITHUB_WORKSPACE/artifact"
 
-          if [ -d package/addons ]; then
-            cd package
-            zip -r "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" addons
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+
+          if [ -d "$GITHUB_WORKSPACE/build/package/addons" ]; then
+
+            echo "Using generated AMBuild package"
+
+            cp -r \
+              "$GITHUB_WORKSPACE/build/package/addons" \
+              "$GITHUB_WORKSPACE/artifact/"
+
           else
-            mkdir -p "$GITHUB_WORKSPACE/artifact"
-            find . -type f \( -name "*.so" -o -name "*.vdf" \) \
-              -exec cp -v {} "$GITHUB_WORKSPACE/artifact/" \;
-            cd "$GITHUB_WORKSPACE/artifact"
-            zip -r "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" .
+
+            echo "No package directory - collecting binaries manually"
+
+            mkdir -p \
+              "$GITHUB_WORKSPACE/artifact/addons/vip_modules"
+
+            find "$GITHUB_WORKSPACE/build" \
+              -type f \
+              -name "*.so" \
+              -exec cp -v {} \
+              "$GITHUB_WORKSPACE/artifact/addons/vip_modules/" \;
+
+            mkdir -p \
+              "$GITHUB_WORKSPACE/artifact/addons/metamod"
+
+            find "$GITHUB_WORKSPACE/build" \
+              -type f \
+              -name "*.vdf" \
+              -exec cp -v {} \
+              "$GITHUB_WORKSPACE/artifact/addons/metamod/" \;
+
           fi
 
-      - name: Upload artifact
+          echo "===== ARTIFACT CONTENT ====="
+
+          find "$GITHUB_WORKSPACE/artifact" \
+            -type f \
+            -print
+
+          cd "$GITHUB_WORKSPACE/artifact"
+
+          zip -r \
+            "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" \
+            .
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: VIP_ViewmodelFOV-linux
