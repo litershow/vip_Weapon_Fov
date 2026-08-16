@@ -83,9 +83,9 @@ jobs:
           test -f "$SCHEMA_DIR/module.cpp"
           test -f "$SCHEMA_DIR/ctimer.cpp"
 
-          # These obsolete implementation files must never enter the graph.
-          if grep -nE 'tier1.*(generichash|keyvalues3)\.cpp' AMBuildScript AMBuilder; then
-            echo "ERROR: obsolete SDK source is still referenced"
+          # Check only actual Python source entries, not comments mentioning old filenames.
+          if grep -nE "os\.path\.join\(.*tier1.*(generichash|keyvalues3)\.cpp" AMBuildScript AMBuilder; then
+            echo "ERROR: obsolete SDK source is still referenced as a build source"
             exit 1
           fi
 
