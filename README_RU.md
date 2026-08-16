@@ -1,28 +1,38 @@
-# VIP FOVWeapon Resolver6 (Linux CS2)
+# VIP FOVWeapon Prediction7
 
-Эта версия не полагается только на старую сигнатуру SetFOV.
+Эта версия проверяет гипотезу, которую подсказал успешный Resolver6:
 
-Она пытается найти штатный вызов сброса:
-`SetFOV(cameraServices, pawn, 0, 0, 0)`
-по runtime Schema offset `CBasePlayerPawn::m_pCameraServices`, затем декодирует
-реальный адрес SetFOV из инструкции `call rel32`.
+- native `CameraServices::SetFOV` detour уже работает (`detour=YES`);
+- reset `target=0` реально блокируется (`resetsBlocked` растёт);
+- но при смене оружия клиент всё равно на один кадр показывает стандартный FOV.
 
-## Тест
+Prediction7 держит **две сетевые величины одновременно**:
 
-Оставьте только один `vip_viewmodelfov.so`, полностью перезапустите сервер.
+1. `CBasePlayerController::m_iDesiredFOV = выбранный FOV` — постоянный fallback для локального prediction;
+2. `CCSPlayerBase_CameraServices::m_iFOV/m_iFOVStart = выбранный FOV` через настоящий native `SetFOV` — тот механизм, который меняет и камеру, и оружие.
 
-В игре:
+Когда CS2 пытается сделать native `SetFOV(..., 0, ...)`, detour по-прежнему заменяет reset на выбранный FOV. Идея нового слоя: если клиент сам локально предсказывает `FOV=0` во время deploy, его fallback уже должен быть не 90, а `m_iDesiredFOV` игрока.
 
-- `!fovscan6` — диагностика резолвера
-- `!fovv6 120` — включить FOV 120
-- `!fovv6 off` — выключить и вернуть игровой FOV
+## Тестовые команды
 
-Нормальная диагностика:
+```
+!fovpred7 120
+!fovscan7
+!fovpred7 off
+```
 
-`resolver=reset-call` или `resolver=body+reset-call`
-`resetSites>=1 targets=1`
-`entry=clean` или `entry=prehooked-chainable`
-`detour=YES`
+После `!fovpred7 120` ожидается:
 
-Если target найден, но entry неизвестен, `!fovscan6` покажет первые 16 байт entry.
-Плагин в таком случае НЕ ставит hook, чтобы не крашить сервер.
+```
+[FOV7] target=120 desired=120 cam=120/120 detour=YES ...
+```
+
+Переключите нож/пистолет/автомат несколько раз и снова выполните `!fovscan7`.
+
+Если визуальный рывок исчез — это нужная комбинация для финального VIP-модуля.
+
+Если `desired=120`, `cam=120/120`, `resetsBlocked` растёт, но рывок всё равно остаётся, то он уже почти наверняка формируется целиком в клиентском deploy/view prediction до использования этих серверных network vars.
+
+## Важно
+
+Оставьте только один `vip_viewmodelfov.so` и один соответствующий `.vdf`. Полностью перезапустите процесс сервера перед тестом.

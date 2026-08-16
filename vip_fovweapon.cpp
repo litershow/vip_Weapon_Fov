@@ -42,6 +42,7 @@ SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
 // Runtime schema offsets. No player/camera field offset is hard-coded.
 // -----------------------------------------------------------------------------
 static int g_iPlayerPawnHandleOffset = -1;
+static int g_iDesiredFOVOffset = -1;
 static int g_iCameraServicesOffset = -1;
 static int g_iCameraFOVOffset = -1;
 static int g_iCameraFOVStartOffset = -1;
@@ -60,6 +61,7 @@ static std::array<int, 64> g_TargetFOV{};
 static std::array<CEntityInstance*, 64> g_CachedPawn{};
 static std::array<uint64_t, 64> g_InterceptedResets{};
 static std::array<uint64_t, 64> g_EmergencyRepairs{};
+static std::array<uint64_t, 64> g_DesiredRepairs{};
 
 // Recovered SysV ABI for the supplied Linux libserver.so:
 //   bool CCSPlayerBase_CameraServices::SetFOV(ownerPawn, target, start, rate)
@@ -117,6 +119,7 @@ static int FindServerOffset(const char* className, const char* fieldName)
 static void ResolveOffsets()
 {
     g_iPlayerPawnHandleOffset = FindServerOffset("CCSPlayerController", "m_hPlayerPawn");
+    g_iDesiredFOVOffset = FindServerOffset("CBasePlayerController", "m_iDesiredFOV");
     g_iCameraServicesOffset = FindServerOffset("CBasePlayerPawn", "m_pCameraServices");
     g_iCameraFOVOffset = FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOV");
     g_iCameraFOVStartOffset = FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOVStart");
@@ -125,8 +128,9 @@ static void ResolveOffsets()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVResolver6] schema: Pawn=0x%X CameraPtr=0x%X FOV=0x%X Start=0x%X Rate=0x%X Owner=0x%X\n",
+        "[VIP-FOVPrediction7] schema: Pawn=0x%X Desired=0x%X CameraPtr=0x%X FOV=0x%X Start=0x%X Rate=0x%X Owner=0x%X\n",
         g_iPlayerPawnHandleOffset,
+        g_iDesiredFOVOffset,
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
         g_iCameraFOVStartOffset,
@@ -178,6 +182,42 @@ static CEntityInstance* GetController(int slot)
     if (slot < 0 || slot >= 64)
         return nullptr;
     return EntityFromIndex(slot + 1);
+}
+
+static int ReadDesiredFOV(int slot)
+{
+    CEntityInstance* controller = GetController(slot);
+    if (!controller || g_iDesiredFOVOffset < 0)
+        return 0;
+
+    return *reinterpret_cast<int*>(
+        reinterpret_cast<uintptr_t>(controller) +
+        static_cast<uintptr_t>(g_iDesiredFOVOffset));
+}
+
+static bool WriteDesiredFOV(int slot, int value, bool forceNetwork = true)
+{
+    CEntityInstance* controller = GetController(slot);
+    if (!controller || g_iDesiredFOVOffset < 0)
+        return false;
+
+    int* desired = reinterpret_cast<int*>(
+        reinterpret_cast<uintptr_t>(controller) +
+        static_cast<uintptr_t>(g_iDesiredFOVOffset));
+
+    const bool changed = (*desired != value);
+    *desired = value;
+
+    if ((changed || forceNetwork) && g_pUtils)
+    {
+        g_pUtils->SetStateChanged(
+            reinterpret_cast<CBaseEntity*>(controller),
+            "CBasePlayerController",
+            "m_iDesiredFOV"
+        );
+    }
+
+    return true;
 }
 
 static CEntityInstance* GetPawn(int slot)
@@ -522,7 +562,7 @@ static bool ResolveNativeSetFOV()
     if (collection.modules.empty())
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVResolver6] no loaded server.so/libserver.so executable module found.\n");
+            "[VIP-FOVPrediction7] no loaded server.so/libserver.so executable module found.\n");
         return false;
     }
 
@@ -566,7 +606,7 @@ static bool ResolveNativeSetFOV()
         {
             g_ResolverMethod = "conflict";
             ConColorMsg(Color(255, 80, 80, 255),
-                "[VIP-FOVResolver6] resolver conflict: body=0x%lX resetTarget=0x%lX; hook disabled.\n",
+                "[VIP-FOVPrediction7] resolver conflict: body=0x%lX resetTarget=0x%lX; hook disabled.\n",
                 static_cast<unsigned long>(bodyEntries[0]),
                 static_cast<unsigned long>(resetTargets[0]));
             return false;
@@ -588,7 +628,7 @@ static bool ResolveNativeSetFOV()
     {
         g_NativeSetFOVMatches = static_cast<int>(bodyEntries.size());
         ConColorMsg(Color(255, 150, 50, 255),
-            "[VIP-FOVResolver6] unresolved: modules=%d body=%zu resetSites=%d resetTargets=%zu.\n",
+            "[VIP-FOVPrediction7] unresolved: modules=%d body=%zu resetSites=%d resetTargets=%zu.\n",
             g_ServerModuleCandidates,
             bodyEntries.size(),
             g_ResetCallSites,
@@ -636,11 +676,11 @@ static bool ResolveNativeSetFOV()
     else
     {
         // We found the native target, but do not overwrite an unknown prologue.
-        // !fovscan6 exposes the first 16 bytes so the resolver can be adapted
+        // !fovscan7 exposes the first 16 bytes so the resolver can be adapted
         // without risking a server crash.
         g_EntryState = "unknown-entry";
         ConColorMsg(Color(255, 150, 50, 255),
-            "[VIP-FOVResolver6] target found by %s at +0x%lX but entry is unknown (%s); hook disabled.\n",
+            "[VIP-FOVPrediction7] target found by %s at +0x%lX but entry is unknown (%s); hook disabled.\n",
             g_ResolverMethod,
             static_cast<unsigned long>(g_NativeSetFOVRVA),
             g_EntryBytesHex.c_str());
@@ -649,7 +689,7 @@ static bool ResolveNativeSetFOV()
     }
 
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVResolver6] SetFOV resolved by %s: %s + 0x%lX entry=%s modules=%d body=%d resetSites=%d.\n",
+        "[VIP-FOVPrediction7] SetFOV resolved by %s: %s + 0x%lX entry=%s modules=%d body=%d resetSites=%d.\n",
         g_ResolverMethod,
         g_SelectedModulePath.c_str(),
         static_cast<unsigned long>(g_NativeSetFOVRVA),
@@ -747,7 +787,7 @@ static bool InstallNativeSetFOVDetour()
         {
             g_TrampolineMemory = nullptr;
             ConColorMsg(Color(255, 80, 80, 255),
-                "[VIP-FOVResolver6] mmap trampoline failed; detour DISABLED.\n");
+                "[VIP-FOVPrediction7] mmap trampoline failed; detour DISABLED.\n");
             return false;
         }
 
@@ -766,7 +806,7 @@ static bool InstallNativeSetFOVDetour()
     {
         g_EntryState = "unknown-entry";
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVResolver6] SetFOV entry has an unknown patch; refusing to overwrite it.\n");
+            "[VIP-FOVPrediction7] SetFOV entry has an unknown patch; refusing to overwrite it.\n");
         return false;
     }
 
@@ -780,7 +820,7 @@ static bool InstallNativeSetFOVDetour()
         }
         g_pOriginalSetFOV = nullptr;
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVResolver6] mprotect libserver text failed; detour DISABLED.\n");
+            "[VIP-FOVPrediction7] mprotect libserver text failed; detour DISABLED.\n");
         return false;
     }
 
@@ -795,7 +835,7 @@ static bool InstallNativeSetFOVDetour()
 
     g_DetourInstalled = true;
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVResolver6] SetFOV detour INSTALLED at libserver.so+0x%lX (%s).\n",
+        "[VIP-FOVPrediction7] SetFOV detour INSTALLED at libserver.so+0x%lX (%s).\n",
         static_cast<unsigned long>(g_NativeSetFOVRVA),
         g_EntryState);
     return true;
@@ -827,13 +867,13 @@ static void RemoveNativeSetFOVDetour()
     }
 
     ConColorMsg(Color(220, 220, 80, 255),
-        "[VIP-FOVResolver6] SetFOV detour removed.\n");
+        "[VIP-FOVPrediction7] SetFOV detour removed.\n");
 }
 #else
 static bool ResolveNativeSetFOV()
 {
     ConColorMsg(Color(255, 150, 50, 255),
-        "[VIP-FOVResolver6] native detour is Linux-only.\n");
+        "[VIP-FOVPrediction7] native detour is Linux-only.\n");
     return false;
 }
 
@@ -866,12 +906,19 @@ static bool SetTargetFOV(int slot, int value)
     if (slot < 0 || slot >= 64 || value < 60 || value > 179 || !g_DetourInstalled)
         return false;
 
+    // Prediction bridge: publish the persistent controller desired FOV BEFORE
+    // touching CameraServices.  When the client locally predicts a deploy/reset
+    // to camera FOV 0, it can fall back to this value instead of default 90.
+    if (!WriteDesiredFOV(slot, value, true))
+        return false;
+
     g_TargetFOV[slot] = value;
     g_CachedPawn[slot] = GetPawn(slot);
 
     if (!CallOriginalSetFOV(slot, value, value, 0.0f))
     {
         g_TargetFOV[slot] = 0;
+        WriteDesiredFOV(slot, 0, true);
         return false;
     }
 
@@ -883,8 +930,11 @@ static void ClearTargetFOV(int slot, bool restoreGameFOV)
     if (slot < 0 || slot >= 64)
         return;
 
-    // Clear first so our detour allows the native target=0 call through.
+    // Clear override first so the detour allows the native zero-reset through.
     g_TargetFOV[slot] = 0;
+
+    // Clear controller fallback before restoring CameraServices to game control.
+    WriteDesiredFOV(slot, 0, true);
 
     if (restoreGameFOV && g_DetourInstalled)
         CallOriginalSetFOV(slot, 0, 0, 0.0f);
@@ -944,14 +994,14 @@ static bool CommandFOVHook(int slot, const char* content)
     if (token == "off" || token == "0")
     {
         ClearTargetFOV(slot, true);
-        g_pUtils->PrintToChat(slot, "[FOV6] override OFF; native game FOV restored");
+        g_pUtils->PrintToChat(slot, "[FOV7] override OFF; native game FOV restored");
         return true;
     }
 
     const int value = std::strtol(token.c_str(), nullptr, 10);
     if (value < 60 || value > 179)
     {
-        g_pUtils->PrintToChat(slot, "[FOV6] Usage: !fovv6 120 (60..179) or !fovv6 off");
+        g_pUtils->PrintToChat(slot, "[FOV7] Usage: !fovpred7 120 (60..179) or !fovpred7 off");
         return true;
     }
 
@@ -959,7 +1009,7 @@ static bool CommandFOVHook(int slot, const char* content)
     {
         g_pUtils->PrintToChat(
             slot,
-            "[FOV6] detour unavailable: resolver=%s body=%d resetSites=%d targets=%d; use !fovscan6",
+            "[FOV7] detour unavailable: resolver=%s body=%d resetSites=%d targets=%d; use !fovscan7",
             g_ResolverMethod,
             g_BodyAnchorMatches,
             g_ResetCallSites,
@@ -969,14 +1019,15 @@ static bool CommandFOVHook(int slot, const char* content)
 
     if (!SetTargetFOV(slot, value))
     {
-        g_pUtils->PrintToChat(slot, "[FOV6] native SetFOV failed; check !fovscan6");
+        g_pUtils->PrintToChat(slot, "[FOV7] native SetFOV failed; check !fovscan7");
         return true;
     }
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV6] target=%d camera=%d/%d detour=ON (zero-reset blocked)",
+        "[FOV7] target=%d desired=%d camera=%d/%d detour=ON prediction-bridge=ON",
         g_TargetFOV[slot],
+        ReadDesiredFOV(slot),
         ReadCameraFOV(slot),
         ReadCameraFOVStart(slot));
     return true;
@@ -991,17 +1042,19 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV6] target=%d cam=%d/%d detour=%s resetsBlocked=%llu emergency=%llu",
+        "[FOV7] target=%d desired=%d cam=%d/%d detour=%s resetsBlocked=%llu emergency=%llu desiredFix=%llu",
         g_TargetFOV[slot],
+        ReadDesiredFOV(slot),
         ReadCameraFOV(slot),
         ReadCameraFOVStart(slot),
         g_DetourInstalled ? "YES" : "NO",
         static_cast<unsigned long long>(g_InterceptedResets[slot]),
-        static_cast<unsigned long long>(g_EmergencyRepairs[slot]));
+        static_cast<unsigned long long>(g_EmergencyRepairs[slot]),
+        static_cast<unsigned long long>(g_DesiredRepairs[slot]));
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV6] resolver=%s modules=%d body=%d resetSites=%d targets=%d",
+        "[FOV7] resolver=%s modules=%d body=%d resetSites=%d targets=%d",
         g_ResolverMethod,
         g_ServerModuleCandidates,
         g_BodyAnchorMatches,
@@ -1010,7 +1063,7 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV6] native rva=0x%lX entry=%s pawn=%s bytes=%s",
+        "[FOV7] native rva=0x%lX entry=%s pawn=%s bytes=%s",
         static_cast<unsigned long>(g_NativeSetFOVRVA),
         g_EntryState,
         g_CachedPawn[slot] ? "OK" : "NULL",
@@ -1018,7 +1071,8 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV6] schema camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
+        "[FOV7] schema desired=0x%X camPtr=0x%X FOV=0x%X Start=0x%X Owner=0x%X",
+        g_iDesiredFOVOffset,
         g_iCameraServicesOffset,
         g_iCameraFOVOffset,
         g_iCameraFOVStartOffset,
@@ -1039,6 +1093,7 @@ static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
     g_CachedPawn[slot] = nullptr;
     g_InterceptedResets[slot] = 0;
     g_EmergencyRepairs[slot] = 0;
+    g_DesiredRepairs[slot] = 0;
 
     if (!isVIP || !g_pVIPCore)
         return;
@@ -1067,7 +1122,9 @@ static void VIP_OnPlayerSpawn_FOVWeapon(int slot, int, bool isVIP)
         return;
 
     g_TargetFOV[slot] = selected;
-    // Pawn is refreshed and the target is applied by the next post GameFrame.
+    // Publish the persistent prediction fallback immediately; the pawn/camera
+    // half is refreshed by the next post GameFrame.
+    WriteDesiredFOV(slot, selected, true);
     g_CachedPawn[slot] = nullptr;
 }
 
@@ -1174,6 +1231,7 @@ static void OnStartupServer()
 
     const bool schemaOK =
         g_iPlayerPawnHandleOffset >= 0 &&
+        g_iDesiredFOVOffset >= 0 &&
         g_iCameraServicesOffset >= 0 &&
         g_iCameraFOVOffset >= 0 &&
         g_iCameraFOVStartOffset >= 0 &&
@@ -1182,14 +1240,14 @@ static void OnStartupServer()
     if (!schemaOK)
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVResolver6] required schema fields missing; detour DISABLED.\n");
+            "[VIP-FOVPrediction7] required schema fields missing; detour DISABLED.\n");
         return;
     }
 
     if (!InstallNativeSetFOVDetour())
     {
         ConColorMsg(Color(255, 80, 80, 255),
-            "[VIP-FOVResolver6] hook was NOT installed. !fovv6 will refuse to enable.\n");
+            "[VIP-FOVPrediction7] hook was NOT installed. !fovpred7 will refuse to enable.\n");
     }
 }
 
@@ -1200,27 +1258,27 @@ void VIPFovWeapon::AllPluginsLoaded()
     g_pUtils = reinterpret_cast<IUtilsApi*>(g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pUtils)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] Utils API not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVPrediction7] Utils API not found.\n");
         return;
     }
 
     g_pMenus = reinterpret_cast<IMenusApi*>(g_SMAPI->MetaFactory(Menus_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pMenus)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] Menus API not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVPrediction7] Menus API not found.\n");
         return;
     }
 
     g_pVIPCore = reinterpret_cast<IVIPApi*>(g_SMAPI->MetaFactory(VIP_INTERFACE, &ret, nullptr));
     if (ret == META_IFACE_FAILED || !g_pVIPCore)
     {
-        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVResolver6] VIP Core not found.\n");
+        ConColorMsg(Color(255, 0, 0, 255), "[VIP-FOVPrediction7] VIP Core not found.\n");
         return;
     }
 
     // Unique names: do not collide with any of the old experimental builds.
-    g_pUtils->RegCommand(g_PLID, {"mm_fovv6"}, {"!fovv6"}, CommandFOVHook);
-    g_pUtils->RegCommand(g_PLID, {"mm_fovscan6"}, {"!fovscan6"}, CommandFOVDiag);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovpred7"}, {"!fovpred7"}, CommandFOVHook);
+    g_pUtils->RegCommand(g_PLID, {"mm_fovscan7"}, {"!fovscan7"}, CommandFOVDiag);
 
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
 
@@ -1230,7 +1288,7 @@ void VIPFovWeapon::AllPluginsLoaded()
     g_pVIPCore->VIP_RegisterFeature("FOV", VIP_STRING, SELECTABLE, OpenFOVMenu);
 
     ConColorMsg(Color(80, 220, 120, 255),
-        "[VIP-FOVResolver6] loaded. Test only: !fovv6 120 / !fovscan6 / !fovv6 off\n");
+        "[VIP-FOVPrediction7] loaded. Test only: !fovpred7 120 / !fovscan7 / !fovpred7 off\n");
 }
 
 void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
@@ -1243,6 +1301,15 @@ void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
         const int target = g_TargetFOV[slot];
         if (target <= 0)
             continue;
+
+        // Keep the controller's persistent desired FOV aligned.  This is not a
+        // per-frame network spam: SetStateChanged is only called if the value
+        // was actually changed by game code.
+        if (ReadDesiredFOV(slot) != target)
+        {
+            if (WriteDesiredFOV(slot, target, true))
+                ++g_DesiredRepairs[slot];
+        }
 
         CEntityInstance* pawn = GetPawn(slot);
         if (!pawn)
@@ -1273,10 +1340,10 @@ void VIPFovWeapon::GameFrame(bool simulating, bool, bool)
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "6.0-reset-call-resolver"; }
+const char* VIPFovWeapon::GetVersion() { return "7.0-prediction-bridge"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
-const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVResolver6]"; }
-const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + native CameraServices SetFOV reset-call resolver"; }
-const char* VIPFovWeapon::GetDescription() { return "VIP FOV that resolves native SetFOV from the game reset call and blocks zero-FOV resets before they reach the client."; }
-const char* VIPFovWeapon::GetName() { return "[VIP] FOV + Weapon Resolver6"; }
+const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVPrediction7]"; }
+const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV adaptation + native SetFOV detour + DesiredFOV prediction bridge"; }
+const char* VIPFovWeapon::GetDescription() { return "VIP FOV that combines native CameraServices SetFOV reset blocking with controller DesiredFOV to bridge client-side weapon-switch prediction."; }
+const char* VIPFovWeapon::GetName() { return "[VIP] FOV + Weapon Prediction7"; }
 const char* VIPFovWeapon::GetURL() { return "https://github.com/Pisex/cs2-vip-modules"; }
