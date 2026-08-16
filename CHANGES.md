@@ -1,12 +1,9 @@
-# Changes — 1.4 final
+# v2.0-clientcmd
 
-- one authoritative per-player FOV state;
-- debug commands and VIP menu no longer fight over different targets;
-- `!fovcam` updates the VIP `FOV_Value` cookie for VIP players;
-- automatic persistent viewmodel XYZ compensation for wide FOV;
-- manual `!fovoffset X Y Z` is persisted through weapon changes;
-- `!fovauto` restores automatic weapon-distance calculation;
-- six-frame event-driven reapply burst after `weapon_switch` / `item_equip`;
-- SchemaSystem offsets remain runtime-resolved (no hard-coded 0x1504 etc.);
-- output remains `vip_viewmodelfov.so`;
-- documented requirement to remove all older/original FOV modules to avoid multiple plugins overwriting each other.
+- Убран ложный server-side auto-XYZ как основной способ отдаления оружия: поля менялись, но клиент их не рендерил.
+- Добавлена `point_clientcommand` entity.
+- `!clientvm <value>` отправляет `viewmodel_fov <value>` на клиент для проверки доставки.
+- `!clientfov <value>` отправляет `fov_cs_debug <value>` на клиент.
+- `!fovexact <value>` совмещает server world/camera FOV и клиентский `fov_cs_debug`.
+- Debug-команды больше не пишут `FOV_Value`, поэтому сохранённое VIP значение не должно перетирать тестовый FOV.
+- VIP-меню по-прежнему сохраняет cookie и применяет выбранное значение.

@@ -19,6 +19,11 @@ static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
 
+// Server map entity used to execute a benign console command on one client.
+// This is the only path in this build that can affect the client-side viewmodel
+// projection used by fov_cs_debug/viewmodel_fov.
+static CBaseEntity* g_pPointClientCommand = nullptr;
+
 std::vector<std::string> g_FOV[64];
 
 struct PlayerFOVState
@@ -214,6 +219,78 @@ static CEntityInstance* GetPawn(int slot)
         );
 
     return EntityFromHandle(pawnHandle);
+}
+
+static bool EnsurePointClientCommand()
+{
+    if (!g_pUtils)
+        return false;
+
+    if (g_pPointClientCommand)
+        return true;
+
+    g_pPointClientCommand =
+        g_pUtils->CreateEntityByName("point_clientcommand", CEntityIndex(-1));
+
+    if (!g_pPointClientCommand)
+    {
+        ConColorMsg(
+            Color(255, 80, 80, 255),
+            "[VIP-FOVWeapon] Could not create point_clientcommand.\n"
+        );
+        return false;
+    }
+
+    g_pUtils->DispatchSpawn(
+        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand)
+    );
+
+    return true;
+}
+
+static bool SendClientConsoleCommand(int slot, const std::string& command)
+{
+    if (slot < 0 || slot >= 64 || command.empty() || !EnsurePointClientCommand())
+        return false;
+
+    CEntityInstance* pawn = GetPawn(slot);
+    if (!pawn)
+        return false;
+
+    CEntityInstance* point =
+        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand);
+
+    // point_clientcommand executes Command on the activating player's client.
+    g_pUtils->AcceptEntityInput(
+        point,
+        "Command",
+        variant_t(command.c_str()),
+        pawn,
+        point
+    );
+
+    return true;
+}
+
+static bool SendClientDebugFOV(int slot, int value)
+{
+    if (value <= 0)
+        return false;
+
+    return SendClientConsoleCommand(
+        slot,
+        std::string("fov_cs_debug ") + std::to_string(value)
+    );
+}
+
+static bool SendClientViewmodelFOV(int slot, float value)
+{
+    if (value <= 0.0f)
+        return false;
+
+    std::ostringstream cmd;
+    cmd << "viewmodel_fov " << value;
+    return SendClientConsoleCommand(slot, cmd.str());
 }
 
 static void* GetCameraServices(int slot)
@@ -460,30 +537,27 @@ static bool ApplyPlayerFOVState(int slot)
     if (!state.enabled || state.worldFOV <= 0)
         return false;
 
-    if (!state.customOffsets)
-        AutoOffsetsForFOV(state.worldFOV, state.viewX, state.viewY, state.viewZ);
-
+    // World FOV is still applied server-side. The local CS2 viewmodel ignores
+    // the pawn m_flViewmodelFOV/Offset network fields, so use the engine's
+    // point_clientcommand entity to execute the exact client-side debug FOV.
     const bool desiredOk = SetWorldFOV(slot, state.worldFOV);
     const bool cameraOk = SetCameraFOV(slot, state.worldFOV);
-    const bool offsetsOk = SetViewmodelOffsets(slot, state.viewX, state.viewY, state.viewZ);
+    const bool clientOk = SendClientDebugFOV(slot, state.worldFOV);
 
-    if (!desiredOk || !cameraOk || !offsetsOk)
+    if (!desiredOk || !cameraOk || !clientOk)
     {
         ConColorMsg(
             Color(255, 180, 50, 255),
-            "[VIP-FOVWeapon] apply failed slot %d: desired=%d camera=%d offsets=%d FOV=%d XYZ=%.2f/%.2f/%.2f\n",
+            "[VIP-FOVWeapon] apply slot %d: desired=%d camera=%d clientcmd=%d FOV=%d\n",
             slot,
             desiredOk ? 1 : 0,
             cameraOk ? 1 : 0,
-            offsetsOk ? 1 : 0,
-            state.worldFOV,
-            state.viewX,
-            state.viewY,
-            state.viewZ
+            clientOk ? 1 : 0,
+            state.worldFOV
         );
     }
 
-    return desiredOk && cameraOk && offsetsOk;
+    return desiredOk && cameraOk && clientOk;
 }
 
 static bool SetPlayerFOVTarget(int slot, int worldFOV, bool saveCookie)
@@ -617,22 +691,23 @@ static bool CommandFOVWeapon(int slot, const char* content)
         return true;
     }
 
-    if (!SetPlayerFOVTarget(slot, value, true))
+    // Do NOT touch the VIP cookie from a debug command. This prevents a saved
+    // menu value (for example 150) from fighting the requested test value.
+    if (!SetPlayerFOVTarget(slot, value, false))
     {
-        g_pUtils->PrintToChat(slot, "[FOV] Failed. Check server console offsets.");
+        g_pUtils->PrintToChat(slot, "[FOV] Failed. Check server console.");
         return true;
     }
 
     ReapplyPlayerFOV(slot);
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] world=%d camera=%d/%d weaponXYZ=%.2f %.2f %.2f",
+        "[FOV] requested=%d target=%d world=%d camera=%d/%d client=fov_cs_debug",
+        value,
+        g_PlayerFOV[slot].worldFOV,
         ReadWorldFOV(slot),
         ReadCameraFOV(slot),
-        ReadCameraFOVStart(slot),
-        g_PlayerFOV[slot].viewX,
-        g_PlayerFOV[slot].viewY,
-        g_PlayerFOV[slot].viewZ
+        ReadCameraFOVStart(slot)
     );
     return true;
 }
@@ -660,9 +735,8 @@ static bool CommandFOVCam(int slot, const char* content)
         return true;
     }
 
-    // Use the exact same state/cookie path as the VIP menu. This prevents an
-    // old saved VIP value (for example 150) from restoring over !fovcam 120.
-    if (!SetPlayerFOVTarget(slot, value, true))
+    // Debug command uses runtime state only; it intentionally does not write the VIP cookie.
+    if (!SetPlayerFOVTarget(slot, value, false))
     {
         g_pUtils->PrintToChat(slot, "[FOV] CameraServices write failed. See server console.");
         return true;
@@ -690,39 +764,75 @@ static bool CommandFOVOffset(int slot, const char* content)
     const auto tokens = Tokens(content);
     if (tokens.size() < 3)
     {
-        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovoffset 10 0 0");
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovoffset 2.5 2 -2");
         return true;
     }
 
-    // Arguments are always the final 3 whitespace-separated tokens.
     const float x = std::strtof(tokens[tokens.size() - 3].c_str(), nullptr);
     const float y = std::strtof(tokens[tokens.size() - 2].c_str(), nullptr);
     const float z = std::strtof(tokens[tokens.size() - 1].c_str(), nullptr);
 
-    if (slot >= 0 && slot < 64)
-    {
-        g_PlayerFOV[slot].viewX = x;
-        g_PlayerFOV[slot].viewY = y;
-        g_PlayerFOV[slot].viewZ = z;
-        g_PlayerFOV[slot].customOffsets = true;
-    }
+    std::ostringstream cmd;
+    cmd << "viewmodel_offset_x " << x
+        << "; viewmodel_offset_y " << y
+        << "; viewmodel_offset_z " << z;
 
-    if (!SetViewmodelOffsets(slot, x, y, z))
-    {
-        g_pUtils->PrintToChat(slot, "[FOV] Viewmodel offset write failed. See server console.");
-        return true;
-    }
+    const bool clientOk = SendClientConsoleCommand(slot, cmd.str());
 
-    // Keep a custom XYZ alive across weapon switches too.
-    if (slot >= 0 && slot < 64 && g_PlayerFOV[slot].worldFOV > 0)
-        ReapplyPlayerFOV(slot);
+    // Also write the server pawn fields only so !fovdiag can compare both paths.
+    SetViewmodelOffsets(slot, x, y, z);
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] offsets X=%.2f Y=%.2f Z=%.2f",
-        ReadPawnFloat(slot, g_iViewmodelOffsetXOffset),
-        ReadPawnFloat(slot, g_iViewmodelOffsetYOffset),
-        ReadPawnFloat(slot, g_iViewmodelOffsetZOffset)
+        "[FOV] client viewmodel offsets sent=%s X=%.2f Y=%.2f Z=%.2f",
+        clientOk ? "yes" : "no",
+        x, y, z
+    );
+    return true;
+}
+
+static bool CommandClientFOV(int slot, const char* content)
+{
+    if (!g_pUtils)
+        return true;
+
+    const std::string token = LastToken(content);
+    const int value = std::strtol(token.c_str(), nullptr, 10);
+    if (value <= 0)
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !clientfov 120");
+        return true;
+    }
+
+    const bool ok = SendClientDebugFOV(slot, value);
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] sent client command: fov_cs_debug %d (%s)",
+        value,
+        ok ? "entity accepted" : "failed"
+    );
+    return true;
+}
+
+static bool CommandClientVM(int slot, const char* content)
+{
+    if (!g_pUtils)
+        return true;
+
+    const std::string token = LastToken(content);
+    const float value = std::strtof(token.c_str(), nullptr);
+    if (value <= 0.0f)
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !clientvm 54");
+        return true;
+    }
+
+    const bool ok = SendClientViewmodelFOV(slot, value);
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] sent client command: viewmodel_fov %.2f (%s)",
+        value,
+        ok ? "entity accepted" : "failed"
     );
     return true;
 }
@@ -732,23 +842,21 @@ static bool CommandFOVAuto(int slot, const char*)
     if (!g_pUtils || slot < 0 || slot >= 64)
         return true;
 
-    PlayerFOVState& state = g_PlayerFOV[slot];
-    int fov = state.worldFOV > 0 ? state.worldFOV : ReadWorldFOV(slot);
+    int fov = g_PlayerFOV[slot].worldFOV;
+    if (fov <= 0)
+        fov = ReadWorldFOV(slot);
     if (fov <= 0)
         fov = 90;
 
-    state.worldFOV = fov;
-    state.enabled = true;
-    state.customOffsets = false;
-    AutoOffsetsForFOV(fov, state.viewX, state.viewY, state.viewZ);
-    ReapplyPlayerFOV(slot);
+    g_PlayerFOV[slot].worldFOV = fov;
+    g_PlayerFOV[slot].enabled = true;
+    const bool ok = ApplyPlayerFOVState(slot);
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] automatic weapon distance enabled: %.2f %.2f %.2f",
-        state.viewX,
-        state.viewY,
-        state.viewZ
+        "[FOV] re-applied world+client debug FOV=%d (%s)",
+        fov,
+        ok ? "ok" : "partial/failed"
     );
     return true;
 }
@@ -771,12 +879,11 @@ static bool CommandFOVDiag(int slot, const char*)
 
     g_pUtils->PrintToChat(
         slot,
-        "[FOV] vmXYZ=%.2f %.2f %.2f target=%d auto=%s",
+        "[FOV] server vmXYZ=%.2f %.2f %.2f target=%d (local render is client-side)",
         ReadPawnFloat(slot, g_iViewmodelOffsetXOffset),
         ReadPawnFloat(slot, g_iViewmodelOffsetYOffset),
         ReadPawnFloat(slot, g_iViewmodelOffsetZOffset),
-        (slot >= 0 && slot < 64) ? g_PlayerFOV[slot].worldFOV : 0,
-        (slot >= 0 && slot < 64 && !g_PlayerFOV[slot].customOffsets) ? "yes" : "no"
+        (slot >= 0 && slot < 64) ? g_PlayerFOV[slot].worldFOV : 0
     );
 
     g_pUtils->PrintToChat(
@@ -852,7 +959,9 @@ static void OnStartupServer()
 {
     g_pGameEntitySystem = g_pUtils->GetCGameEntitySystem();
     g_pEntitySystem = g_pUtils->GetCEntitySystem();
+    g_pPointClientCommand = nullptr;
     ResolveOffsets();
+    EnsurePointClientCommand();
 }
 
 static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
@@ -932,10 +1041,10 @@ static bool OpenFOVMenu(int slot, const char*)
 
                 if (worldFOV > 0)
                 {
-                    // Menu selection intentionally resets manual XYZ tuning
-                    // back to automatic weapon distance for the chosen FOV.
+                    // Menu selection becomes the persistent VIP FOV value.
                     g_PlayerFOV[slot].customOffsets = false;
-                    SetPlayerFOVTarget(slot, worldFOV, true);
+                    SetPlayerFOVTarget(slot, worldFOV, false);
+                    SaveFOVCookieIfVIP(slot, worldFOV);
                     ReapplyPlayerFOV(slot);
                 }
 
@@ -1034,6 +1143,27 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     g_pUtils->RegCommand(
         g_PLID,
+        {"mm_fovexact"},
+        {"!fovexact"},
+        CommandFOVWeapon
+    );
+
+    g_pUtils->RegCommand(
+        g_PLID,
+        {"mm_clientfov"},
+        {"!clientfov"},
+        CommandClientFOV
+    );
+
+    g_pUtils->RegCommand(
+        g_PLID,
+        {"mm_clientvm"},
+        {"!clientvm"},
+        CommandClientVM
+    );
+
+    g_pUtils->RegCommand(
+        g_PLID,
         {"mm_fovdiag"},
         {"!fovdiag", "!fovinfo"},
         CommandFOVDiag
@@ -1060,24 +1190,24 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] v1.4 loaded: world FOV + automatic persistent weapon distance. Commands: !fovcam !fovweapon !fovoffset !fovauto !fovdiag\n"
+        "[VIP-FOVWeapon] v2.0-clientcmd loaded: world FOV + client fov_cs_debug via point_clientcommand. Commands: !fovexact !clientfov !clientvm !fovdiag\n"
     );
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "1.4-final"; }
+const char* VIPFovWeapon::GetVersion() { return "2.0-clientcmd"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
 const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVWeapon]"; }
 const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmodel adaptation"; }
 
 const char* VIPFovWeapon::GetDescription()
 {
-    return "VIP world FOV plus persistent automatic weapon distance, restored after weapon switches.";
+    return "VIP world FOV plus client-side fov_cs_debug delivery via point_clientcommand.";
 }
 
 const char* VIPFovWeapon::GetName()
 {
-    return "[VIP] FOV + Weapon";
+    return "[VIP] FOV + Client Viewmodel";
 }
 
 const char* VIPFovWeapon::GetURL()
