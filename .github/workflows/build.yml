@@ -61,7 +61,6 @@ jobs:
           rm -rf "$SCHEMA_DIR"
           git clone https://github.com/Pisex/SchemaEntity.git "$SCHEMA_DIR"
 
-          # Compatibility changes used in Pisex-style current builds.
           sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' \
             "$SCHEMA_DIR/schemasystem.cpp"
 
@@ -70,6 +69,47 @@ jobs:
 
           sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
             "$SCHEMA_DIR/CCSPlayerController.h"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          p = Path(os.environ["SCHEMA_DIR"]) / "globaltypes.h"
+          s = p.read_text(encoding="utf-8")
+
+          marker = '#include "soundflags.h"'
+          compat = '''
+// ---- vip_Weapon_Fov build compatibility ----
+// These trace/hitbox helper types are referenced by unrelated
+// SchemaEntity headers but are absent from current AM hl2sdk-cs2.
+struct Ray_t
+{
+    unsigned char _opaque[64];
+};
+
+class CHitBox;
+
+enum RayType_t : int
+{
+    RAY_TYPE_COMPAT = 0
+};
+
+enum HitGroup_t : int
+{
+    HITGROUP_COMPAT = 0
+};
+// ---- end compatibility ----
+'''
+
+          if "RAY_TYPE_COMPAT" not in s:
+              s = s.replace(marker, marker + "\n" + compat)
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+          echo "===== SchemaEntity compatibility block ====="
+          grep -n -A25 -B2 "vip_Weapon_Fov build compatibility" \
+            "$SCHEMA_DIR/globaltypes.h"
 
       - name: Verify sources
         run: |
