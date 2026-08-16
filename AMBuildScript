@@ -259,14 +259,14 @@ class MMSPluginConfig(object):
       cxx.defines += ['SE_{}={}'.format(other_sdk['define'], other_sdk['code'])]
 
     cxx.defines += ['META_IS_SOURCE2']
+    # Current CS2 HL2SDK no longer ships the old tier1 source paths
+    # (generichash.cpp / convar.cpp / keyvalues3.cpp) used by older plugins.
+    # Keep only Source 2 implementation files that still exist in the SDK.
     binary.sources += [
       os.path.join(sdk['path'], 'public', 'tier0', 'memoverride.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'generichash.cpp'),
       os.path.join(sdk['path'], 'entity2', 'entitysystem.cpp'),
       os.path.join(sdk['path'], 'entity2', 'entityidentity.cpp'),
       os.path.join(sdk['path'], 'entity2', 'entitykeyvalues.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'convar.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'keyvalues3.cpp'),
     ]
 
     SdkHelpers.configureCxx(context, binary, sdk)

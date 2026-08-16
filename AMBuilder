@@ -1,18 +1,31 @@
 # vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
 import os
 
+# One CS2 SDK target -> one Metamod binary.
 for sdk_target in MMSPlugin.sdk_targets:
     sdk = sdk_target.sdk
     cxx = sdk_target.cxx
 
     cxx.cxxflags += ['-Wno-invalid-offsetof']
-    binary = MMSPlugin.HL2Library(builder, cxx, MMSPlugin.plugin_name, sdk)
+
+    # HL2Library already adds the current Source 2 SDK implementation sources
+    # in AMBuildScript. Do not add tier1/entity2 sources again here.
+    binary = MMSPlugin.HL2Library(
+        builder,
+        cxx,
+        MMSPlugin.plugin_name,
+        sdk
+    )
 
     binary.custom = [
         builder.tools.Protoc(
             protoc=sdk_target.protoc,
             sources=[
-                os.path.join(sdk['path'], 'common', 'network_connection.proto')
+                os.path.join(
+                    sdk['path'],
+                    'common',
+                    'network_connection.proto'
+                )
             ]
         )
     ]
@@ -27,18 +40,10 @@ for sdk_target in MMSPlugin.sdk_targets:
         os.path.join('..', 'SchemaEntity', 'schemasystem.cpp'),
     ]
 
-    # IMPORTANT:
-    # Do NOT add tier1/convar.cpp or tier1/generichash.cpp.
-    # Current AlliedModders CS2 HL2SDK no longer has those old source paths.
-    if sdk_target in ['dota', 'cs2']:
-        binary.sources += [
-            os.path.join(sdk.path, 'entity2', 'entitysystem.cpp'),
-            os.path.join(sdk.path, 'entity2', 'entityidentity.cpp'),
-            os.path.join(sdk.path, 'public', 'tier0', 'memoverride.cpp'),
-        ]
-
     if cxx.target.arch == 'x86':
-        binary.sources += ['sourcehook/sourcehook_hookmangen.cpp']
+        binary.sources += [
+            'sourcehook/sourcehook_hookmangen.cpp'
+        ]
 
     nodes = builder.Add(binary)
     MMSPlugin.binaries += [nodes]
