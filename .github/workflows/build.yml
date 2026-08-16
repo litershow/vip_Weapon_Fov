@@ -63,6 +63,8 @@ jobs:
             -s cs2 \
             --targets x86_64 \
             --enable-optimize \
+            --plugin-name vip_viewmodelfov \
+            --plugin-alias vip_viewmodelfov \
             --hl2sdk-manifests="$MMS_PATH/hl2sdk-manifests" \
             --mms_path="$MMS_PATH" \
             --hl2sdk-root="$HL2SDK_ROOT"
@@ -74,8 +76,16 @@ jobs:
 
       - name: Verify linked plugin
         run: |
-          SO="$(find build -type f -name 'vip_viewmodelfov.so' | head -1)"
-          test -n "$SO"
+          echo "===== all built shared libraries ====="
+          find build -type f -name '*.so' -print || true
+
+          SO="$(find build -type f -name 'vip_viewmodelfov.so' -print -quit)"
+          if [ -z "$SO" ]; then
+            echo "ERROR: vip_viewmodelfov.so was not produced"
+            echo "===== files containing vip/fov in their name ====="
+            find build -type f \( -iname '*vip*' -o -iname '*fov*' \) -print || true
+            exit 1
+          fi
 
           echo "Built: $SO"
 
