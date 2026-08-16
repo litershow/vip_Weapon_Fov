@@ -187,15 +187,6 @@ class MMSPluginConfig(object):
 
     cxx.defines += ['META_IS_SOURCE2']
 
-    # Current CS2 HL2SDK: old tier1/generichash.cpp and keyvalues3.cpp are gone.
-    # These Source2 sources are enough for this plugin + SchemaEntity.
-    binary.sources += [
-      os.path.join(sdk['path'], 'public', 'tier0', 'memoverride.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entitysystem.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entityidentity.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entitykeyvalues.cpp'),
-    ]
-
     # convar.cpp may exist on some SDK revisions, but this module does not need
     # to compile the old tier1 implementation directly.
     SdkHelpers.configureCxx(context, binary, sdk)

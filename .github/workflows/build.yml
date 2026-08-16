@@ -17,13 +17,12 @@ jobs:
     env:
       HL2SDK_ROOT: "${{ github.workspace }}/external"
       MMS_PATH: "${{ github.workspace }}/external/metamod-source"
-      SCHEMA_DIR: "${{ github.workspace }}/../SchemaEntity"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build tools
+      - name: Install dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qy
@@ -38,7 +37,6 @@ jobs:
           python3 -m pip install --upgrade pip importlib-metadata
           python3 -m pip install setuptools==45.2.0
 
-          rm -rf /tmp/ambuild
           git clone https://github.com/alliedmodders/ambuild.git /tmp/ambuild
           cd /tmp/ambuild
           pip3 install .
@@ -47,67 +45,19 @@ jobs:
         run: |
           mkdir -p "$HL2SDK_ROOT"
 
-          rm -rf "$MMS_PATH"
           git clone --recursive --branch master --single-branch \
             https://github.com/alliedmodders/metamod-source.git \
             "$MMS_PATH"
 
-          rm -rf "$HL2SDK_ROOT/hl2sdk-cs2"
           git clone --recursive --branch cs2 --single-branch \
             https://github.com/alliedmodders/hl2sdk.git \
             "$HL2SDK_ROOT/hl2sdk-cs2"
 
-      - name: Download and patch SchemaEntity
-        run: |
-          rm -rf "$SCHEMA_DIR"
-          git clone https://github.com/Pisex/SchemaEntity.git "$SCHEMA_DIR"
-
-          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' \
-            "$SCHEMA_DIR/schemasystem.cpp"
-
-          sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' \
-            "$SCHEMA_DIR/CCSPlayerPawn.h"
-
-          sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
-            "$SCHEMA_DIR/CCSPlayerController.h"
-
-          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_schema.py"
-
-          echo "===== SchemaEntity compatibility block ====="
-          grep -n -A25 -B2 "vip_Weapon_Fov build compatibility" \
-            "$SCHEMA_DIR/globaltypes.h"
-
-      - name: Verify sources
-        run: |
-          test -f "$GITHUB_WORKSPACE/AMBuildScript"
-          test -f "$GITHUB_WORKSPACE/AMBuilder"
-          test -f "$GITHUB_WORKSPACE/configure.py"
-          test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.cpp"
-          test -f "$GITHUB_WORKSPACE/vip_viewmodelfov.h"
-          test -f "$SCHEMA_DIR/schemasystem.cpp"
-          test -f "$SCHEMA_DIR/module.cpp"
-          test -f "$SCHEMA_DIR/ctimer.cpp"
-
-      - name: Verify current CS2 manifest
-        run: |
-          echo "===== Metamod CS2 manifest ====="
-          cat "$MMS_PATH/hl2sdk-manifests/manifests/cs2.json"
-
-          if grep -q '"lib/linux64/tier1.a"'             "$MMS_PATH/hl2sdk-manifests/manifests/cs2.json"; then
-            echo "ERROR: Metamod manifest still references removed tier1.a"
-            exit 1
-          fi
-
-          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/mathlib.a"
-          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/interfaces.a"
-          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/release/libprotobuf.a"
-          test -f "$HL2SDK_ROOT/hl2sdk-cs2/lib/linux64/libtier0.so"
-
       - name: Configure
         run: |
-          rm -rf "$GITHUB_WORKSPACE/build"
-          mkdir -p "$GITHUB_WORKSPACE/build"
-          cd "$GITHUB_WORKSPACE/build"
+          rm -rf build
+          mkdir build
+          cd build
 
           python3 ../configure.py \
             -s cs2 \
@@ -119,27 +69,29 @@ jobs:
 
       - name: Build
         run: |
-          cd "$GITHUB_WORKSPACE/build"
+          cd build
           ambuild -j 1
 
-      - name: Show output
-        if: always()
+      - name: Check undefined KeyValues3
         run: |
-          echo "===== shared libraries ====="
-          find "$GITHUB_WORKSPACE/build" -type f -name "*.so" -print || true
-          echo "===== package ====="
-          find "$GITHUB_WORKSPACE/build/package" -type f -print 2>/dev/null || true
+          SO="$(find build -type f -name 'vip_viewmodelfov.so' | head -1)"
+          test -n "$SO"
 
-      - name: Package
-        if: success()
-        run: |
-          cd "$GITHUB_WORKSPACE/build/package"
-          zip -r "$GITHUB_WORKSPACE/VIP_ViewmodelFOV-linux.zip" addons
+          echo "Built: $SO"
+          echo "===== undefined KeyValues3 symbols ====="
+
+          if nm -D -u "$SO" | grep -q 'KeyValues3'; then
+            nm -D -u "$SO" | grep 'KeyValues3'
+            echo "ERROR: plugin still has unresolved KeyValues3 symbols"
+            exit 1
+          fi
+
+          echo "No unresolved KeyValues3 symbols."
 
       - name: Upload artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: VIP_ViewmodelFOV-linux
-          path: VIP_ViewmodelFOV-linux.zip
+          path: build/package
           if-no-files-found: error
+          compression-level: 9
