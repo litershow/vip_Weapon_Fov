@@ -1,79 +1,134 @@
 name: Build VIP_ViewmodelFOV
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/pisex/ubuntu20:latest
+
+    env:
+      HL2SDK_ROOT: "${{ github.workspace }}/external"
+      MMS_PATH: "${{ github.workspace }}/external/metamod-source"
+      MANIFEST_PATH: "${{ github.workspace }}/VIP_ViewmodelFOV/source/hl2sdk-manifests"
 
     steps:
-      - name: Checkout plugin
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Show repository structure
         run: |
-          sudo apt update
-          sudo apt install -y \
+          pwd
+          find . -maxdepth 3 -type f | sort | head -200
+
+      - name: Set up dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -qy
+
+          apt-get install -y \
             git \
+            binutils \
             python3 \
             python3-pip \
-            build-essential \
-            clang \
-            protobuf-compiler
+            zip
 
-      - name: Install AMBuild
-        run: |
-          git clone https://github.com/alliedmodders/ambuild.git
+          python3 -m pip install --upgrade pip importlib-metadata
+          python3 -m pip install setuptools==45.2.0
+
+          git clone https://github.com/alliedmodders/ambuild.git ambuild
+
           cd ambuild
-          python3 -m pip install --user .
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          pip3 install .
+          cd ..
 
-      - name: Clone SchemaEntity
-        run: |
+          mkdir -p external
+          cd external
+
+          git clone --recursive --branch master --single-branch \
+            https://github.com/alliedmodders/metamod-source.git
+
+          git clone --recursive --branch cs2 --single-branch \
+            https://github.com/alliedmodders/hl2sdk.git hl2sdk-cs2
+
+          cd ..
+
           git clone https://github.com/Pisex/SchemaEntity.git SchemaEntity
 
-      - name: Clone Metamod Source
-        run: |
-          git clone --recurse-submodules \
-            https://github.com/alliedmodders/metamod-source.git \
-            metamod-source
+          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' \
+            SchemaEntity/schemasystem.cpp
 
-      - name: Download CS2 SDK dependencies
-        run: |
-          cd metamod-source
-          ./support/checkout-deps.sh -s cs2
+          sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' \
+            SchemaEntity/CCSPlayerPawn.h
 
-      - name: Show directories
-        run: |
-          find . -maxdepth 3 -type d | sort | head -200
+          sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' \
+            SchemaEntity/CCSPlayerController.h
 
-      - name: Configure
+      - name: Put SchemaEntity next to plugin
+        run: |
+          rm -rf VIP_ViewmodelFOV/SchemaEntity
+          cp -r SchemaEntity VIP_ViewmodelFOV/SchemaEntity
+
+          echo "SchemaEntity:"
+          ls -la VIP_ViewmodelFOV/SchemaEntity | head -50
+
+      - name: Configure plugin
         working-directory: VIP_ViewmodelFOV/source
         run: |
-          python3 configure.py \
-            --mms_path=$GITHUB_WORKSPACE/metamod-source \
-            --hl2sdk-root=$GITHUB_WORKSPACE \
-            --hl2sdk-manifests=$PWD/hl2sdk-manifests \
+          mkdir -p build
+          cd build
+
+          python3 ../configure.py \
             -s cs2 \
-            --targets=x86_64 \
-            --enable-optimize
+            --targets x86_64 \
+            --enable-optimize \
+            --hl2sdk-manifests=../hl2sdk-manifests \
+            --mms_path=$MMS_PATH \
+            --hl2sdk-root=$HL2SDK_ROOT
 
-      - name: Build
-        working-directory: VIP_ViewmodelFOV/source
+      - name: Build plugin
+        working-directory: VIP_ViewmodelFOV/source/build
         run: |
-          ambuild obj
+          ambuild
 
-      - name: List output
+      - name: Show build output
+        if: always()
         run: |
-          find VIP_ViewmodelFOV/source/obj -type f -maxdepth 5 -print
+          echo "===== SO files ====="
+          find VIP_ViewmodelFOV -type f -name "*.so" -print || true
 
-      - name: Upload build
+          echo "===== package ====="
+          find VIP_ViewmodelFOV -path "*package*" -type f -print || true
+
+      - name: Collect artifact
+        run: |
+          mkdir -p artifact
+
+          find VIP_ViewmodelFOV \
+            -type f \
+            \( -name "*.so" -o -name "*.vdf" \) \
+            -exec cp -v {} artifact/ \;
+
+          cp VIP_ViewmodelFOV/README_VIEWMODELFOV.md artifact/ || true
+
+          cd artifact
+          zip -r ../VIP_ViewmodelFOV-build.zip .
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: VIP_ViewmodelFOV-linux
-          path: |
-            VIP_ViewmodelFOV/source/obj/**/*.so
-            VIP_ViewmodelFOV/source/obj/**/*.vdf
+          path: VIP_ViewmodelFOV-build.zip
