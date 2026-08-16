@@ -1,5 +1,5 @@
-#ifndef _INCLUDE_VIP_VIEWMODELFOV_PLUGIN_H_
-#define _INCLUDE_VIP_VIEWMODELFOV_PLUGIN_H_
+#ifndef _INCLUDE_VIP_FOVWEAPON_PLUGIN_H_
+#define _INCLUDE_VIP_FOVWEAPON_PLUGIN_H_
 
 #include <ISmmPlugin.h>
 #include <igameevents.h>
@@ -17,7 +17,7 @@ class CTimer;
 #include "include/vip.h"
 #include "include/menus.h"
 
-class VIPViewmodelFOV : public ISmmPlugin, public IMetamodListener
+class VIPFovWeapon : public ISmmPlugin, public IMetamodListener
 {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late);
@@ -35,7 +35,7 @@ public:
     const char* GetLogTag();
 };
 
-extern VIPViewmodelFOV g_VIPViewmodelFOV;
+extern VIPFovWeapon g_VIPFovWeapon;
 
 PLUGIN_GLOBALVARS();
 

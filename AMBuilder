@@ -28,7 +28,7 @@ for sdk_target in MMSPlugin.sdk_targets:
     ]
 
     binary.sources += [
-        'vip_viewmodelfov.cpp',
+        'vip_fovweapon.cpp',
     ]
 
     if cxx.target.arch == 'x86':

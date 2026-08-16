@@ -54,8 +54,8 @@ class MMSPluginConfig(object):
     self.all_targets = []
     self.target_archs = set()
 
-    self.plugin_name = builder.options.plugin_name or 'vip_viewmodelfov'
-    self.plugin_alias = builder.options.plugin_alias or 'vip_viewmodelfov'
+    self.plugin_name = builder.options.plugin_name or 'vip_fovweapon'
+    self.plugin_alias = builder.options.plugin_alias or 'vip_fovweapon'
 
     target_archs = builder.options.targets.split(',') if builder.options.targets else ['x86_64']
 
