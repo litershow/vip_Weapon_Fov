@@ -27,6 +27,13 @@ PLUGIN_EXPOSE(VIPFovWeapon, g_VIPFovWeapon);
 static int g_iDesiredFOVOffset = -1;
 static int g_iPlayerPawnHandleOffset = -1;
 static int g_iViewmodelFOVOffset = -1;
+static int g_iViewmodelOffsetXOffset = -1;
+static int g_iViewmodelOffsetYOffset = -1;
+static int g_iViewmodelOffsetZOffset = -1;
+static int g_iCameraServicesOffset = -1;
+static int g_iCameraFOVOffset = -1;
+static int g_iCameraFOVStartOffset = -1;
+static int g_iCameraFOVRateOffset = -1;
 
 // CS2 defaults used to make the weapon move visually together with world FOV.
 // Example: world 110 => viewmodel ~83.11, world 120 => viewmodel ~90.67.
@@ -83,13 +90,37 @@ static void ResolveOffsets()
     // server-side networked field on CCSPlayerPawn.
     g_iViewmodelFOVOffset =
         FindServerOffset("CCSPlayerPawn", "m_flViewmodelFOV");
+    g_iViewmodelOffsetXOffset =
+        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetX");
+    g_iViewmodelOffsetYOffset =
+        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetY");
+    g_iViewmodelOffsetZOffset =
+        FindServerOffset("CCSPlayerPawn", "m_flViewmodelOffsetZ");
+
+    // Camera services live on the CBasePlayerPawn base class; the concrete
+    // Counter-Strike service object is CCSPlayerBase_CameraServices.
+    g_iCameraServicesOffset =
+        FindServerOffset("CBasePlayerPawn", "m_pCameraServices");
+    g_iCameraFOVOffset =
+        FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOV");
+    g_iCameraFOVStartOffset =
+        FindServerOffset("CCSPlayerBase_CameraServices", "m_iFOVStart");
+    g_iCameraFOVRateOffset =
+        FindServerOffset("CCSPlayerBase_CameraServices", "m_flFOVRate");
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] offsets: DesiredFOV=0x%X PawnHandle=0x%X ViewmodelFOV=0x%X\n",
+        "[VIP-FOVWeapon] offsets: Desired=0x%X Pawn=0x%X VMFOV=0x%X VMXYZ=[0x%X 0x%X 0x%X] CameraPtr=0x%X Camera=[FOV:0x%X Start:0x%X Rate:0x%X]\n",
         g_iDesiredFOVOffset,
         g_iPlayerPawnHandleOffset,
-        g_iViewmodelFOVOffset
+        g_iViewmodelFOVOffset,
+        g_iViewmodelOffsetXOffset,
+        g_iViewmodelOffsetYOffset,
+        g_iViewmodelOffsetZOffset,
+        g_iCameraServicesOffset,
+        g_iCameraFOVOffset,
+        g_iCameraFOVStartOffset,
+        g_iCameraFOVRateOffset
     );
 }
 
@@ -165,6 +196,134 @@ static CEntityInstance* GetPawn(int slot)
         );
 
     return EntityFromHandle(pawnHandle);
+}
+
+static void* GetCameraServices(int slot)
+{
+    if (g_iCameraServicesOffset < 0)
+        ResolveOffsets();
+
+    CEntityInstance* pawn = GetPawn(slot);
+    if (!pawn || g_iCameraServicesOffset < 0)
+        return nullptr;
+
+    return *reinterpret_cast<void**>(
+        reinterpret_cast<uintptr_t>(pawn) +
+        static_cast<uintptr_t>(g_iCameraServicesOffset)
+    );
+}
+
+static bool SetCameraFOV(int slot, int value)
+{
+    if (value <= 0)
+        return false;
+
+    if (g_iCameraFOVOffset < 0 ||
+        g_iCameraFOVStartOffset < 0 ||
+        g_iCameraServicesOffset < 0)
+    {
+        ResolveOffsets();
+    }
+
+    CEntityInstance* pawn = GetPawn(slot);
+    void* camera = GetCameraServices(slot);
+    if (!pawn || !camera || g_iCameraFOVOffset < 0 || g_iCameraFOVStartOffset < 0)
+        return false;
+
+    *reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVOffset)
+    ) = static_cast<uint32_t>(value);
+
+    *reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVStartOffset)
+    ) = static_cast<uint32_t>(value);
+
+    if (g_iCameraFOVRateOffset >= 0)
+    {
+        *reinterpret_cast<float*>(
+            reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVRateOffset)
+        ) = 0.0f;
+    }
+
+    // Camera services are networked through the pawn. Mark the owning
+    // networked service pointer dirty so the service state is serialized.
+    if (g_pUtils)
+    {
+        g_pUtils->SetStateChanged(
+            reinterpret_cast<CBaseEntity*>(pawn),
+            "CBasePlayerPawn",
+            "m_pCameraServices"
+        );
+    }
+
+    return true;
+}
+
+static int ReadCameraFOV(int slot)
+{
+    if (g_iCameraFOVOffset < 0)
+        ResolveOffsets();
+
+    void* camera = GetCameraServices(slot);
+    if (!camera || g_iCameraFOVOffset < 0)
+        return 0;
+
+    return static_cast<int>(*reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVOffset)
+    ));
+}
+
+static int ReadCameraFOVStart(int slot)
+{
+    if (g_iCameraFOVStartOffset < 0)
+        ResolveOffsets();
+
+    void* camera = GetCameraServices(slot);
+    if (!camera || g_iCameraFOVStartOffset < 0)
+        return 0;
+
+    return static_cast<int>(*reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uintptr_t>(camera) + static_cast<uintptr_t>(g_iCameraFOVStartOffset)
+    ));
+}
+
+static float ReadPawnFloat(int slot, int offset)
+{
+    CEntityInstance* pawn = GetPawn(slot);
+    if (!pawn || offset < 0)
+        return 0.0f;
+
+    return *reinterpret_cast<float*>(
+        reinterpret_cast<uintptr_t>(pawn) + static_cast<uintptr_t>(offset)
+    );
+}
+
+static bool SetViewmodelOffsets(int slot, float x, float y, float z)
+{
+    if (g_iViewmodelOffsetXOffset < 0 ||
+        g_iViewmodelOffsetYOffset < 0 ||
+        g_iViewmodelOffsetZOffset < 0)
+    {
+        ResolveOffsets();
+    }
+
+    CEntityInstance* pawn = GetPawn(slot);
+    if (!pawn || !g_pUtils ||
+        g_iViewmodelOffsetXOffset < 0 ||
+        g_iViewmodelOffsetYOffset < 0 ||
+        g_iViewmodelOffsetZOffset < 0)
+    {
+        return false;
+    }
+
+    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetXOffset) = x;
+    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetYOffset) = y;
+    *reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(pawn) + g_iViewmodelOffsetZOffset) = z;
+
+    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetX");
+    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetY");
+    g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pawn), "CCSPlayerPawn", "m_flViewmodelOffsetZ");
+    return true;
 }
 
 static bool SetWorldFOV(int slot, int value)
@@ -318,6 +477,19 @@ static std::string LastToken(const char* text)
     return last;
 }
 
+static std::vector<std::string> Tokens(const char* text)
+{
+    std::vector<std::string> out;
+    if (!text)
+        return out;
+
+    std::stringstream ss(text);
+    std::string token;
+    while (ss >> token)
+        out.push_back(token);
+    return out;
+}
+
 // Optional debug/test command: !fovweapon 110
 static bool CommandFOVWeapon(int slot, const char* content)
 {
@@ -350,6 +522,105 @@ static bool CommandFOVWeapon(int slot, const char* content)
     }
 
     g_pUtils->PrintToChat(slot, "[FOV] world=%d viewmodel=%.2f", value, vm);
+    return true;
+}
+
+static bool CommandFOVCam(int slot, const char* content)
+{
+    if (!g_pUtils)
+        return true;
+
+    const std::string token = LastToken(content);
+    const int value = std::strtol(token.c_str(), nullptr, 10);
+
+    if (value <= 0)
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovcam 120");
+        return true;
+    }
+
+    if (!SetCameraFOV(slot, value))
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] CameraServices write failed. See server console.");
+        return true;
+    }
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] camera=%d start=%d (requested %d)",
+        ReadCameraFOV(slot),
+        ReadCameraFOVStart(slot),
+        value
+    );
+    return true;
+}
+
+static bool CommandFOVOffset(int slot, const char* content)
+{
+    if (!g_pUtils)
+        return true;
+
+    const auto tokens = Tokens(content);
+    if (tokens.size() < 3)
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Usage: !fovoffset 10 0 0");
+        return true;
+    }
+
+    // Arguments are always the final 3 whitespace-separated tokens.
+    const float x = std::strtof(tokens[tokens.size() - 3].c_str(), nullptr);
+    const float y = std::strtof(tokens[tokens.size() - 2].c_str(), nullptr);
+    const float z = std::strtof(tokens[tokens.size() - 1].c_str(), nullptr);
+
+    if (!SetViewmodelOffsets(slot, x, y, z))
+    {
+        g_pUtils->PrintToChat(slot, "[FOV] Viewmodel offset write failed. See server console.");
+        return true;
+    }
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] offsets X=%.2f Y=%.2f Z=%.2f",
+        ReadPawnFloat(slot, g_iViewmodelOffsetXOffset),
+        ReadPawnFloat(slot, g_iViewmodelOffsetYOffset),
+        ReadPawnFloat(slot, g_iViewmodelOffsetZOffset)
+    );
+    return true;
+}
+
+static bool CommandFOVDiag(int slot, const char*)
+{
+    if (!g_pUtils)
+        return true;
+
+    ResolveOffsets();
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] world=%d vmFOV=%.2f cam=%d/%d",
+        ReadWorldFOV(slot),
+        ReadViewmodelFOV(slot),
+        ReadCameraFOV(slot),
+        ReadCameraFOVStart(slot)
+    );
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] vmXYZ=%.2f %.2f %.2f",
+        ReadPawnFloat(slot, g_iViewmodelOffsetXOffset),
+        ReadPawnFloat(slot, g_iViewmodelOffsetYOffset),
+        ReadPawnFloat(slot, g_iViewmodelOffsetZOffset)
+    );
+
+    g_pUtils->PrintToChat(
+        slot,
+        "[FOV] schema desired=0x%X vm=0x%X camPtr=0x%X camFOV=0x%X",
+        g_iDesiredFOVOffset,
+        g_iViewmodelFOVOffset,
+        g_iCameraServicesOffset,
+        g_iCameraFOVOffset
+    );
+
     return true;
 }
 
@@ -567,6 +838,27 @@ void VIPFovWeapon::AllPluginsLoaded()
         CommandFOVInfo
     );
 
+    g_pUtils->RegCommand(
+        g_PLID,
+        {"mm_fovcam"},
+        {"!fovcam"},
+        CommandFOVCam
+    );
+
+    g_pUtils->RegCommand(
+        g_PLID,
+        {"mm_fovoffset"},
+        {"!fovoffset"},
+        CommandFOVOffset
+    );
+
+    g_pUtils->RegCommand(
+        g_PLID,
+        {"mm_fovdiag"},
+        {"!fovdiag", "!fovinfo"},
+        CommandFOVDiag
+    );
+
     g_pUtils->StartupServer(g_PLID, OnStartupServer);
 
     g_pVIPCore->VIP_OnClientLoaded(VIP_OnClientLoaded_FOVWeapon);
@@ -583,12 +875,12 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] loaded. FOV now changes camera + viewmodel. Commands: !fovweapon !fovweaponinfo\n"
+        "[VIP-FOVWeapon] loaded. Diagnostic commands: !fovweapon !fovweaponinfo !fovcam !fovoffset !fovdiag\n"
     );
 }
 
 const char* VIPFovWeapon::GetLicense() { return "Public"; }
-const char* VIPFovWeapon::GetVersion() { return "1.1"; }
+const char* VIPFovWeapon::GetVersion() { return "1.2-diag"; }
 const char* VIPFovWeapon::GetDate() { return __DATE__; }
 const char* VIPFovWeapon::GetLogTag() { return "[VIP-FOVWeapon]"; }
 const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmodel adaptation"; }

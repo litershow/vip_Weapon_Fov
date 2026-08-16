@@ -74,3 +74,24 @@ vip_viewmodelfov.so
 ```
 
 `configure.py` в workflow явно получает `--plugin-name vip_viewmodelfov --plugin-alias vip_viewmodelfov`, поэтому проверка сборки и создаваемый `.so` совпадают.
+
+## Диагностика CameraServices / viewmodel offsets (v1.2-diag)
+
+В этой версии добавлены команды без VIP-проверки специально для теста:
+
+```text
+!fovdiag
+!fovcam 120
+!fovdiag
+!fovoffset 10 0 0
+!fovdiag
+```
+
+Что смотреть:
+
+* `!fovcam 120` должен написать в чат `camera=120 start=120`. После этого проверить глазами, изменился ли FOV/оружие.
+* `!fovoffset 10 0 0` должен написать новые X/Y/Z. Проверить глазами, сдвинулось ли оружие.
+* Для возврата offsets можно попробовать `!fovoffset 0 0 0`.
+* `!fovweapon 120` по-прежнему меняет `m_iDesiredFOV` и `m_flViewmodelFOV`.
+
+Offsets для CameraServices и viewmodel полей ищутся через SchemaSystem во время запуска, а не зашиты числом.

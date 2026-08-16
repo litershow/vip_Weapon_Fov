@@ -7,3 +7,9 @@
 - Added proportional world->viewmodel FOV mapping.
 - Added `!fovweapon` and `!fovweaponinfo` test commands.
 - No hard-coded CS2 offsets are used.
+
+## 1.2-diag
+- Added runtime schema lookup for `CBasePlayerPawn::m_pCameraServices`.
+- Added `!fovcam <value>` to test `CCSPlayerBase_CameraServices::m_iFOV/m_iFOVStart`.
+- Added `!fovoffset <x> <y> <z>` to test server-networked viewmodel offsets.
+- Added `!fovdiag` / `!fovinfo` diagnostic output.
