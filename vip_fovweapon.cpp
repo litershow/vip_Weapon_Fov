@@ -19,10 +19,9 @@ static ISchemaSystem* s_pSchemaSystem = nullptr;
 CGameEntitySystem* g_pGameEntitySystem = nullptr;
 CEntitySystem* g_pEntitySystem = nullptr;
 
-// Server map entity used to execute a benign console command on one client.
-// This is the only path in this build that can affect the client-side viewmodel
-// projection used by fov_cs_debug/viewmodel_fov.
-static CBaseEntity* g_pPointClientCommand = nullptr;
+// Client console commands are sent through IVEngineServer2::ClientCommand.
+// Do NOT create/DispatchSpawn point_clientcommand here: on current CS2 builds
+// the entity spawn path can crash when the underlying DispatchSpawn pointer/API is stale.
 
 std::vector<std::string> g_FOV[64];
 
@@ -221,55 +220,19 @@ static CEntityInstance* GetPawn(int slot)
     return EntityFromHandle(pawnHandle);
 }
 
-static bool EnsurePointClientCommand()
-{
-    if (!g_pUtils)
-        return false;
-
-    if (g_pPointClientCommand)
-        return true;
-
-    g_pPointClientCommand =
-        g_pUtils->CreateEntityByName("point_clientcommand", CEntityIndex(-1));
-
-    if (!g_pPointClientCommand)
-    {
-        ConColorMsg(
-            Color(255, 80, 80, 255),
-            "[VIP-FOVWeapon] Could not create point_clientcommand.\n"
-        );
-        return false;
-    }
-
-    g_pUtils->DispatchSpawn(
-        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand),
-        nullptr
-    );
-
-    return true;
-}
-
 static bool SendClientConsoleCommand(int slot, const std::string& command)
 {
-    if (slot < 0 || slot >= 64 || command.empty() || !EnsurePointClientCommand())
+    if (!engine || slot < 0 || slot >= 64 || command.empty())
         return false;
 
-    CEntityInstance* pawn = GetPawn(slot);
-    if (!pawn)
+    CPlayerSlot playerSlot(slot);
+    if (!playerSlot.IsValid())
         return false;
 
-    CEntityInstance* point =
-        reinterpret_cast<CEntityInstance*>(g_pPointClientCommand);
-
-    // point_clientcommand executes Command on the activating player's client.
-    g_pUtils->AcceptEntityInput(
-        point,
-        "Command",
-        variant_t(command.c_str()),
-        pawn,
-        point
-    );
-
+    // Native engine API. This mimics the client typing the command itself.
+    // The engine will only allow commands that are permitted for remote client
+    // execution (FCVAR_CLIENT_CAN_EXECUTE and other engine-side restrictions).
+    engine->ClientCommand(playerSlot, "%s", command.c_str());
     return true;
 }
 
@@ -539,8 +502,8 @@ static bool ApplyPlayerFOVState(int slot)
         return false;
 
     // World FOV is still applied server-side. The local CS2 viewmodel ignores
-    // the pawn m_flViewmodelFOV/Offset network fields, so use the engine's
-    // point_clientcommand entity to execute the exact client-side debug FOV.
+    // the pawn m_flViewmodelFOV/Offset network fields, so try the engine's
+    // native ClientCommand path for the exact client-side debug FOV.
     const bool desiredOk = SetWorldFOV(slot, state.worldFOV);
     const bool cameraOk = SetCameraFOV(slot, state.worldFOV);
     const bool clientOk = SendClientDebugFOV(slot, state.worldFOV);
@@ -960,9 +923,7 @@ static void OnStartupServer()
 {
     g_pGameEntitySystem = g_pUtils->GetCGameEntitySystem();
     g_pEntitySystem = g_pUtils->GetCEntitySystem();
-    g_pPointClientCommand = nullptr;
     ResolveOffsets();
-    EnsurePointClientCommand();
 }
 
 static void VIP_OnClientLoaded_FOVWeapon(int slot, bool isVIP)
@@ -1191,7 +1152,7 @@ void VIPFovWeapon::AllPluginsLoaded()
 
     ConColorMsg(
         Color(80, 220, 120, 255),
-        "[VIP-FOVWeapon] v2.0-clientcmd loaded: world FOV + client fov_cs_debug via point_clientcommand. Commands: !fovexact !clientfov !clientvm !fovdiag\n"
+        "[VIP-FOVWeapon] v2.1-safeclient loaded: world FOV + IVEngineServer2::ClientCommand test. Commands: !fovexact !clientfov !clientvm !fovdiag\n"
     );
 }
 
@@ -1203,7 +1164,7 @@ const char* VIPFovWeapon::GetAuthor() { return "Pisex VIP_FOV + combined viewmod
 
 const char* VIPFovWeapon::GetDescription()
 {
-    return "VIP world FOV plus client-side fov_cs_debug delivery via point_clientcommand.";
+    return "VIP world FOV plus safe client-command delivery through IVEngineServer2::ClientCommand.";
 }
 
 const char* VIPFovWeapon::GetName()

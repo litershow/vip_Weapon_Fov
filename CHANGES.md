@@ -1,13 +1,7 @@
-# v2.0-clientcmd
+# Changes - v2.1 safe client command
 
-- Убран ложный server-side auto-XYZ как основной способ отдаления оружия: поля менялись, но клиент их не рендерил.
-- Добавлена `point_clientcommand` entity.
-- `!clientvm <value>` отправляет `viewmodel_fov <value>` на клиент для проверки доставки.
-- `!clientfov <value>` отправляет `fov_cs_debug <value>` на клиент.
-- `!fovexact <value>` совмещает server world/camera FOV и клиентский `fov_cs_debug`.
-- Debug-команды больше не пишут `FOV_Value`, поэтому сохранённое VIP значение не должно перетирать тестовый FOV.
-- VIP-меню по-прежнему сохраняет cookie и применяет выбранное значение.
-
-## Build fix
-- Fixed Linux compile error in `EnsurePointClientCommand()`.
-- `IUtilsApi::DispatchSpawn` requires two arguments in this SDK, so the call now passes `nullptr` for `CEntityKeyValues*`.
+- Удалён `point_clientcommand`.
+- Удалены `CreateEntityByName("point_clientcommand")` и `DispatchSpawn`.
+- Исправлен SIGSEGV на старте сервера, вызванный опасным entity-spawn путём предыдущей версии.
+- `!clientfov` / `!clientvm` теперь отправляются через `IVEngineServer2::ClientCommand`.
+- `#include <eiface.h>` добавлен явно для актуального объявления `IVEngineServer2`/`CPlayerSlot`.
